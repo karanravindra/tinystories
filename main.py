@@ -14,13 +14,16 @@ default_device = "mps" if torch.backends.mps.is_available() else "cuda" if torch
 parser = argparse.ArgumentParser(description="Train a small GPT on TinyStories")
 parser.add_argument("--device", default=default_device)
 # data
-parser.add_argument("--n-tokens", type=int, default=2_000_000_000, help="total tokens (90%% train, seen once; 10%% val)")
+parser.add_argument("--n-tokens", type=int, default=500_000_000, help="total tokens (90%% train, seen once; 10%% val)")
 parser.add_argument("--vocab-size", type=int, default=8192, help="BPE vocab size")
-parser.add_argument("--block-size", type=int, default=256)
-parser.add_argument("--batch-size", type=int, default=32)
+parser.add_argument("--cache-dir", default="cache", help="cache for tokenizer + tokenized data")
+parser.add_argument("--rebuild-cache", action="store_true", help="ignore and overwrite cached tokenizer/tokens")
+parser.add_argument("--max-story-tokens", type=int, default=1024, help="drop stories longer than this many tokens (0 = keep all)")
+parser.add_argument("--block-size", type=int, default=512)
+parser.add_argument("--batch-size", type=int, default=64)
 # model
-parser.add_argument("--dim", type=int, default=64)
-parser.add_argument("--n-heads", type=int, default=4)
+parser.add_argument("--dim", type=int, default=384)
+parser.add_argument("--n-heads", type=int, default=8)
 parser.add_argument("--n-layers", type=int, default=4)
 # train
 parser.add_argument("--optimizer", choices=["muon", "adamw"], default="muon")
@@ -47,7 +50,9 @@ device = args.device
 
 # %% data
 global_batch_size = args.block_size * args.batch_size
-data = TinyStoriesData(args.block_size, args.batch_size, device, n_tokens=args.n_tokens, vocab_size=args.vocab_size)
+data = TinyStoriesData(args.block_size, args.batch_size, device, n_tokens=args.n_tokens, vocab_size=args.vocab_size,
+    cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
+    max_story_tokens=args.max_story_tokens)
 
 # %% model
 model = GPT(

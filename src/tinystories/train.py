@@ -1,6 +1,7 @@
+import time
+
 import matplotlib.pyplot as plt
 import torch
-from tqdm import tqdm
 
 from tinystories.data import TinyStoriesData
 from tinystories.model import GPT
@@ -38,6 +39,7 @@ def train(
     optimizer: str = "muon",
     eval_every: int = 100,
     eval_batches: int = 20,
+    log_every: int = 50,
     compile_mode: str | None = None,
     run=None,
 ) -> tuple[list[float], list[tuple[int, float]]]:
@@ -55,30 +57,35 @@ def train(
     val_losses: list[tuple[int, float]] = []
 
     model.train()
-    with tqdm(total=n_steps * tokens_per_step, unit="tok", unit_scale=True) as pbar:
-        for x, y in data.train_batches():
-            _, loss = fwd(x, y)
-            for opt in optimizers:
-                opt.zero_grad(set_to_none=True)
-            loss.backward()
-            for opt in optimizers:
-                opt.step()
-            losses.append(loss.item())
-            step = len(losses)
-            tokens_seen = step * tokens_per_step
-            log = {"train/loss": losses[-1], "tokens_seen": tokens_seen}
+    t0 = time.time()
+    for x, y in data.train_batches():
+        _, loss = fwd(x, y)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+        loss.backward()
+        for opt in optimizers:
+            opt.step()
+        losses.append(loss.item())
+        step = len(losses)
+        tokens_seen = step * tokens_per_step
+        log = {"train/loss": losses[-1], "tokens_seen": tokens_seen}
 
-            if eval_every > 0 and (step % eval_every == 0 or step == n_steps):
-                val_losses.append((step, evaluate(model, fwd, data, eval_batches)))
-                log["val/loss"] = val_losses[-1][1]
+        if eval_every > 0 and (step % eval_every == 0 or step == n_steps):
+            val_losses.append((step, evaluate(model, fwd, data, eval_batches)))
+            log["val/loss"] = val_losses[-1][1]
 
-            if run is not None:
-                run.log(log)
-            pbar.update(tokens_per_step)
-            postfix = {"loss": f"{losses[-1]:.4f}"}
+        if run is not None:
+            run.log(log)
+
+        if step % log_every == 0 or step == n_steps:
+            elapsed = time.time() - t0
+            steps_per_sec = step / elapsed
+            eta = int((n_steps - step) / steps_per_sec)
+            msg = f"step {step}/{n_steps} | loss {losses[-1]:.4f}"
             if val_losses:
-                postfix["val"] = f"{val_losses[-1][1]:.4f}"
-            pbar.set_postfix(postfix)
+                msg += f" | val {val_losses[-1][1]:.4f}"
+            msg += f" | {steps_per_sec:.2f} step/s | eta {eta // 3600}:{eta % 3600 // 60:02d}:{eta % 60:02d}"
+            print(msg, flush=True)
     return losses, val_losses
 
 
