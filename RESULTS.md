@@ -6,7 +6,7 @@ We train small GPT-style language models on [TinyStories](https://huggingface.co
 
 **Setup for all runs below** (unless noted): 4 layers, width 192, a tokenizer we train ourselves, Muon optimizer for the main weight matrices and AdamW for everything else, a constant learning rate (no warmup or decay), one seed per setting.
 
-**Current best settings:** 16k or 32k vocabulary, AdamW lr 0.02, Muon lr 0.0018 (tuned for 500M training tokens). These are the defaults in `src/tinystories/config.py`.
+**Current best settings:** 16k or 32k vocabulary, AdamW lr 0.02, Muon lr 0.0018 (tuned for 500M training tokens). These are the defaults in `src/tinystories/config.py`. For model shape, use 4–6 layers and as much width as the time budget allows (section 6); the default model shape has not been updated to match.
 
 Figures are in `results/`. To redraw them from wandb: `uv run python results/plot.py`.
 
@@ -141,3 +141,32 @@ All the official models are GPT-Neo models with the GPT-2 tokenizer, learned pos
 - **Above about 4 layers, total size matters more than how it is split between width and depth.** The two best models are shaped in opposite ways: 33M is wide and shallow (width 768, 4 layers), and 28M is half as wide and twice as deep (512, 8 layers). They score almost the same (0.468 vs 0.470). Very shallow models do worse: 2Layers-33M has as many weights outside the embeddings as 28M (25.2M) but scores 0.494 vs 0.470. The models also differ in training data and tokenizer, so this is only suggestive.
 - **The 1Layer-21M and 2Layers-33M models seem to have been trained on data with story metadata.** They often write `Summary:` / `Features:` lines, which probably costs them a little bpb on plain stories.
 - **The dataset contains some garbled characters** (for example `â€™` instead of `’`), and our models sometimes reproduce them.
+
+## 6. Model shape: width and depth (2026-11-07)
+
+**Question:** For a fixed amount of training data, how wide and how deep should the model be? And for a fixed amount of training time?
+
+We trained models of width 128 to 896 (the size of each token's vector inside the model) and depth 2 to 8 layers, all on the 16k vocabulary with the tuned learning rates (AdamW 0.02, Muon 0.0018). Each attention head is 64 wide, so wider models have more heads. Not every combination was run: widths 512 and up were only run at 2 layers, plus 512 at 4 layers. All runs used the same GPU (an RTX 5070 Ti).
+
+The runs up to width 384 saw 424M tokens, one pass over the training stories. The wider ones were run later and saw 500M. To compare them fairly, every score below is taken at 424M tokens, from the validation score logged during training. Because the learning rate is constant and the data comes in the same order, a 500M run's score at 424M tokens is what a 424M run would have scored. These in-training scores use a fixed 655k-token slice of the validation split, which scores about 0.004–0.008 higher than the full validation split.
+
+wandb group: `shape-v16k-500M` (the width 192, 4-layer run is the matching run from `lr-d192-v16k-500M`)
+
+![Validation bpb after 424M tokens for each width and depth](results/shape_grid.png)
+
+*Validation bpb after 424M tokens (lower is better). Darker is better; the best cell is bold. Blank cells were not run.*
+
+![Score against model size for each depth, and the best shape for each training-time budget](results/shape_size_time.png)
+
+*(a) Validation bpb after 424M tokens against the number of parameters outside the embeddings, one line per depth. (b) Validation bpb against training time. Gray lines are individual runs. The black line is the best score reached within each time budget, labelled with the shape that reaches it; a tick marks where the leader changes.*
+
+**What we learned:**
+- **Bigger is still better, and we haven't found the limit.** The best models are width 512 with 4 layers (0.550) and width 384 with 8 layers (0.550), a tie. Both have about 13–14M parameters outside the embeddings, 7–8× our earlier width-192 model (0.623). The 2-layer models are still improving at the largest width we ran (896). On the full validation split, width 512 with 4 layers scores 0.538 after its 500M tokens, our best so far.
+- **From 4 to 8 layers, only total size matters.** In panel (a), the 4-, 6- and 8-layer lines lie on top of each other above about 3M parameters: at equal size they score within about 0.005 of each other, for example width 256 with 4 layers (3.2M parameters, 0.596) against width 192 with 8 layers (3.6M, 0.595). This matches what we saw in the official models (section 5).
+- **2 layers is too shallow.** At equal size, 2-layer models score about 0.010–0.015 worse: width 512 with 2 layers scores 0.586 against 0.572 for width 256 with 8 layers (both 6.3M parameters), and width 768 with 2 layers scores 0.562 against 0.550 for width 384 with 8 layers (both 14.2M).
+- **For a fixed time budget, use 4–6 layers and grow the width with the budget.** Panel (b): with 1–3 minutes, width 256 with 4 layers is best; with 3–6 minutes, width 256 with 6 layers; with 6–10 minutes, width 384 with 6 layers; and with 10–20 minutes, width 512 with 4 layers. Neither 2-layer nor 8-layer models are ever best: 8-layer models score as well for their size but run slower, because more layers means more steps one after the other and smaller matrix multiplies.
+- **Not established yet:**
+  - **Noise:** each shape was run once. Differences under about 0.0015 bpb (one seed's noise) are ties.
+  - **Learning rates:** they were tuned only at width 192 with 4 layers. The model is set up so the learning rate should carry over to other widths (muP), but not to other depths, and we haven't checked either.
+  - **Missing shapes:** the shapes most likely to win, width 512 at 6–8 layers and width 640 and up at 4–8 layers, were not run. A width-640, 4-layer run crashed at 39M tokens, and a width-1024, 2-layer run stopped at 168M tokens; both are left out.
+  - **Time budgets:** the times include each run's startup and compile time (under a minute), and come from a run stopped partway, not from a run whose learning rate was planned for that length.
