@@ -1,137 +1,180 @@
+import functools
 import itertools
+import json
+import shutil
+import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
 from datasets import load_dataset
 
-from tinystories.tokenizer import BPETokenizer, Tokenizer_
+from tinystories.config import DataConfig
+from tinystories.tokenizer import BPETokenizer
 
-TOKENIZER_TRAIN_STORIES = 20_000
-
-
-def _atomic_save_npy(path: Path, arr: np.ndarray) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "wb") as f:
-        np.save(f, arr)
-    tmp.replace(path)
+TOKENIZER_TRAIN_STORIES = 200_000  # supports vocabs up to ~42k (20k stories capped out at 20,292)
+TOKENIZER_VERSION = 1  # bump when BPE training settings change, so old caches aren't reused
 
 
-def _tokenize(train_split, tokenizer: Tokenizer_, n_tokens: int, max_story_tokens: int = 0) -> np.ndarray:
-    """Stream stories, packing them into one token stream until we have n_tokens.
+@functools.cache
+def load_split(name: str):
+    return load_dataset("roneneldan/TinyStories", split=name)
 
-    Stories longer than max_story_tokens (excluding EOS) are dropped; 0 disables the filter.
+
+def _token_dtype(vocab_size: int):
+    return np.uint16 if vocab_size <= 2**16 else np.int32
+
+
+def load_or_train_tokenizer(cfg: DataConfig) -> tuple[BPETokenizer, Path]:
+    """BPE trained on a fixed sample of train stories (independent of n_tokens).
+
+    Returns the tokenizer and its cache dir, which also holds the token streams made with it.
     """
-    dtype = np.uint16 if tokenizer.vocab_size <= 2**16 else np.int32
+    tok_dir = cfg.cache_dir / f"tok_v{cfg.vocab_size}_s{TOKENIZER_TRAIN_STORIES}_r{TOKENIZER_VERSION}"
+    if cfg.rebuild_cache and tok_dir.exists():
+        shutil.rmtree(tok_dir)
+    tok_dir.mkdir(parents=True, exist_ok=True)
+    path = tok_dir / "tokenizer.json"
+    if path.exists():
+        print(f"loaded cached tokenizer {path}")
+        return BPETokenizer.load(path), tok_dir
+    tokenizer = BPETokenizer.train(load_split("train")[:TOKENIZER_TRAIN_STORIES]["text"], cfg.vocab_size)
+    tokenizer.save(path)
+    return tokenizer, tok_dir
+
+
+def _tokenize(
+    split, tokenizer: BPETokenizer, n_tokens: int | None, max_story_tokens: int = 0, start_story: int = 0
+) -> tuple[np.ndarray, int, bool]:
+    """Stream stories from `start_story`, packing them (each followed by EOS) into one token stream.
+
+    Stops once >= n_tokens (None = whole split); stories longer than max_story_tokens (excluding EOS) are
+    dropped, 0 disables the filter. Returns (tokens, stories consumed, whether the split ran out).
+    """
+    dtype = _token_dtype(tokenizer.vocab_size)
+    eos = tokenizer.eos_id
     chunks: list[np.ndarray] = []
-    total = 0
-    for batch in train_split.iter(batch_size=1000):
+    total = consumed = 0
+    exhausted = True  # unless we stop early below
+    if start_story:
+        split = split.select(range(min(start_story, len(split)), len(split)))
+    for batch in split.iter(batch_size=1000):
         stories = batch["text"]
-        if isinstance(tokenizer, BPETokenizer):
-            eos = tokenizer.eos_id
-            encoded = tokenizer.encode_batch(stories)
-            if max_story_tokens:
-                encoded = [e for e in encoded if len(e) <= max_story_tokens]
-            chunk = np.fromiter(
-                itertools.chain.from_iterable(itertools.chain(s, (eos,)) for s in encoded), dtype=dtype
-            )
-        else:
-            encoded = [tokenizer.encode(s + "\n") for s in stories]
-            if max_story_tokens:
-                encoded = [e for e in encoded if len(e) <= max_story_tokens]
-            chunk = np.fromiter(itertools.chain.from_iterable(encoded), dtype=dtype)
+        encoded = tokenizer.encode_batch(stories)
+        if max_story_tokens:
+            encoded = [e for e in encoded if len(e) <= max_story_tokens]
+        chunk = np.fromiter(itertools.chain.from_iterable(itertools.chain(s, (eos,)) for s in encoded), dtype=dtype)
         chunks.append(chunk)
         total += len(chunk)
-        if total >= n_tokens:
+        consumed += len(stories)
+        if n_tokens is not None and total >= n_tokens:
+            exhausted = False
             break
-    return np.concatenate(chunks)[:n_tokens]
+    return (np.concatenate(chunks) if chunks else np.empty(0, dtype=dtype)), consumed, exhausted
 
 
-class TinyStoriesData:
-    def __init__(
-        self,
-        block_size: int,
-        batch_size: int,
-        device: str,
-        n_tokens: int = 1_000_000,
-        tokenizer: Tokenizer_ | None = None,
-        vocab_size: int = 4096,
-        cache_dir: str | Path | None = "cache",
-        rebuild_cache: bool = False,
-        max_story_tokens: int = 1024,
-    ) -> None:
-        # Caching only applies to the built-in BPE tokenizer (its cache key is vocab_size/n_tokens).
-        use_cache = tokenizer is None and cache_dir is not None
-        cache = Path(cache_dir) if use_cache else None
-        if cache is not None:
-            cache.mkdir(parents=True, exist_ok=True)
-            tok_path = cache / f"tokenizer_v{vocab_size}_s{TOKENIZER_TRAIN_STORIES}.json"
-            tokens_path = cache / f"tokens_v{vocab_size}_s{TOKENIZER_TRAIN_STORIES}_n{n_tokens}_max{max_story_tokens}.npy"
-            if rebuild_cache:
-                tok_path.unlink(missing_ok=True)
-                tokens_path.unlink(missing_ok=True)
+class TokenCache:
+    """Append-only token stream cache.
 
-        train_split = None
+    Asking for more tokens than are cached tokenizes only the stories after the ones already consumed and
+    appends them, so a 250M cache is extended to 500M rather than rebuilt. `<name>.json` is the source of
+    truth (written after the data), so a crash mid-append leaves at most some ignored trailing bytes.
+    It records the tokenizer hash (mismatch = stale cache) and whether the dataset split ran out.
+    """
 
-        def get_split():
-            nonlocal train_split
-            if train_split is None:
-                train_split = load_dataset("roneneldan/TinyStories")["train"]
-            return train_split
+    def __init__(self, directory: Path, name: str, dtype, tokenizer_sha256: str) -> None:
+        self.bin = directory / f"{name}.bin"
+        self.meta = directory / f"{name}.json"
+        self.dtype = np.dtype(dtype)
+        self.sha = tokenizer_sha256
 
-        # Train our own BPE on a fixed sample of stories unless a tokenizer is passed in.
-        # It is independent of n_tokens so the vocab doesn't change with the dataset size.
-        if tokenizer is not None:
-            self.tokenizer = tokenizer
-        elif cache is not None and tok_path.exists():
-            self.tokenizer = BPETokenizer.load(tok_path)
-            print(f"loaded cached tokenizer {tok_path}")
-        else:
-            self.tokenizer = BPETokenizer.train(get_split()[:TOKENIZER_TRAIN_STORIES]["text"], vocab_size)
-            if cache is not None:
-                self.tokenizer.save(tok_path)
+    def state(self) -> dict:
+        if not (self.bin.exists() and self.meta.exists()):
+            return {"tokens": 0, "stories": 0, "exhausted": False, "tokenizer_sha256": self.sha}
+        m = json.loads(self.meta.read_text())
+        if m.get("tokenizer_sha256") != self.sha:
+            raise RuntimeError(
+                f"{self.bin} was built with a different tokenizer; rerun with --data.rebuild-cache"
+            )
+        return m
 
-        if cache is not None and tokens_path.exists():
-            data = np.load(tokens_path, mmap_mode="r")
-            print(f"loaded cached tokens {tokens_path} ({len(data):,} tokens)")
-        else:
-            data = _tokenize(get_split(), self.tokenizer, n_tokens, max_story_tokens)
-            if cache is not None:
-                _atomic_save_npy(tokens_path, data)
-                print(f"cached {len(data):,} tokens to {tokens_path}")
+    def append(self, tokens: np.ndarray, stories: int, exhausted: bool) -> None:
+        m = self.state()
+        with open(self.bin, "r+b" if self.bin.exists() else "wb") as f:
+            f.truncate(m["tokens"] * self.dtype.itemsize)  # drop any orphaned bytes from an interrupted append
+            f.seek(0, 2)
+            tokens.astype(self.dtype, copy=False).tofile(f)
+        meta = {
+            "tokens": m["tokens"] + len(tokens),
+            "stories": m["stories"] + stories,
+            "exhausted": exhausted,
+            "tokenizer_sha256": self.sha,
+        }
+        tmp = self.meta.with_name(self.meta.name + ".tmp")
+        tmp.write_text(json.dumps(meta))
+        tmp.replace(self.meta)
 
-        split = int(0.9 * len(data))
-        self.train, self.val = data[:split], data[split:]  # numpy views (uint16), converted per batch
+    def load(self) -> np.ndarray:
+        return np.memmap(self.bin, dtype=self.dtype, mode="r", shape=(self.state()["tokens"],))
 
+
+def load_tokens(
+    split: str, tokenizer: BPETokenizer, tok_dir: Path, n_tokens: int | None = None, max_story_tokens: int = 0
+) -> np.ndarray:
+    """Cached token stream for a dataset split: the first n_tokens (None = the whole split)."""
+    name = "val" if split == "validation" else f"{split}_max{max_story_tokens}"
+    cache = TokenCache(tok_dir, name, _token_dtype(tokenizer.vocab_size), tokenizer.sha256)
+    m = cache.state()
+    want = n_tokens if n_tokens is not None else float("inf")
+    if m["tokens"] < want and not m["exhausted"]:
+        if m["tokens"]:
+            print(f"extending {name} token cache from {m['tokens']:,} tokens (resuming at story {m['stories']:,})")
+        need = None if n_tokens is None else n_tokens - m["tokens"]
+        new, consumed, exhausted = _tokenize(load_split(split), tokenizer, need, max_story_tokens, m["stories"])
+        cache.append(new, consumed, exhausted)
+        print(f"cached {len(new):,} new tokens in {cache.bin}")
+    data = cache.load()
+    if n_tokens is not None:
+        if len(data) < n_tokens:
+            warnings.warn(f"requested {n_tokens:,} {split} tokens, dataset has {len(data):,}; using all of it")
+        data = data[:n_tokens]
+    print(f"loaded {split} tokens {cache.bin} ({len(data):,} tokens)")
+    return data
+
+
+class Batcher:
+    """Non-overlapping (block_size + 1)-token windows from a token stream, as (x, y) batches on `device`."""
+
+    def __init__(self, tokens: np.ndarray, block_size: int, batch_size: int, device: str, seed: int = 0) -> None:
+        self.tokens = tokens
         self.block_size = block_size
         self.batch_size = batch_size
         self.device = device
-
-    def _stack(self, d: np.ndarray, starts) -> tuple[torch.Tensor, torch.Tensor]:
-        starts = [int(i) for i in starts]
-        x = np.stack([d[i : i + self.block_size] for i in starts]).astype(np.int64)
-        y = np.stack([d[i + 1 : i + self.block_size + 1] for i in starts]).astype(np.int64)
-        return torch.from_numpy(x).to(self.device), torch.from_numpy(y).to(self.device)
+        self.seed = seed
+        self.n_windows = (len(tokens) - 1) // block_size
+        self.pin = torch.device(device).type == "cuda"
 
     @property
     def steps_per_epoch(self) -> int:
-        return ((len(self.train) - 1) // self.block_size) // self.batch_size
+        return self.n_windows // self.batch_size
+
+    def _stack(self, starts) -> tuple[torch.Tensor, torch.Tensor]:
+        w = torch.from_numpy(np.stack([self.tokens[i : i + self.block_size + 1] for i in starts.tolist()]))
+        w = w.long()
+        if self.pin:
+            w = w.pin_memory()
+        w = w.to(self.device, non_blocking=self.pin)
+        return w[:, :-1], w[:, 1:]
 
     def train_batches(self):
-        """One pass over the train stream: non-overlapping windows, shuffled, each token used once."""
-        n_windows = (len(self.train) - 1) // self.block_size
-        starts = torch.randperm(n_windows) * self.block_size
+        """One pass: windows shuffled (seeded), each token used once."""
+        g = torch.Generator().manual_seed(self.seed)
+        starts = torch.randperm(self.n_windows, generator=g) * self.block_size
         for b in range(self.steps_per_epoch):
-            yield self._stack(self.train, starts[b * self.batch_size : (b + 1) * self.batch_size])
+            yield self._stack(starts[b * self.batch_size : (b + 1) * self.batch_size])
 
-    def val_batches(self, n: int):
-        """Deterministic val batches (first n of non-overlapping windows) so val loss is comparable across evals."""
-        n_windows = (len(self.val) - 1) // self.block_size
-        for b in range(min(n, n_windows // self.batch_size)):
-            starts = torch.arange(b * self.batch_size, (b + 1) * self.batch_size) * self.block_size
-            yield self._stack(self.val, starts)
-
-    def get_batch(self, split: str) -> tuple[torch.Tensor, torch.Tensor]:
-        d = self.train if split == "train" else self.val
-        ix = torch.randint(len(d) - self.block_size - 1, (self.batch_size,))
-        return self._stack(d, ix)
+    def eval_batches(self, n: int | None = None):
+        """Deterministic batches: the first n (None = all full batches), so evals are comparable."""
+        n = self.steps_per_epoch if n is None else min(n, self.steps_per_epoch)
+        for b in range(n):
+            yield self._stack(torch.arange(b * self.batch_size, (b + 1) * self.batch_size) * self.block_size)

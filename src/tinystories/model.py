@@ -1,15 +1,18 @@
 import torch
 import torch.nn.functional as F
+from cut_cross_entropy import linear_cross_entropy
 from torch import nn
+
+from tinystories.config import ModelConfig
 
 
 class MLP(nn.Module):
     def __init__(self, dim: int, m: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim, dim * m),
+            nn.Linear(dim, dim * m, bias=False),
             nn.GELU(),
-            nn.Linear(dim * m, dim),
+            nn.Linear(dim * m, dim, bias=False),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -33,8 +36,9 @@ class Attention(nn.Module):
         head_dim = dim // n_heads
         assert head_dim % 2 == 0, "head_dim must be even for RoPE"
         self.n_heads = n_heads
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
+        self.scale = 1.0 / head_dim  # muP: 1/d attention scaling instead of 1/sqrt(d)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
 
         inv_freq = 1.0 / rope_base ** (torch.arange(0, head_dim, 2).float() / head_dim)
         freqs = torch.outer(torch.arange(block_size).float(), inv_freq)  # (block_size, head_dim/2)
@@ -47,7 +51,7 @@ class Attention(nn.Module):
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = (t.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2) for t in (q, k, v))
         q, k = apply_rope(q, self.cos[:T], self.sin[:T]), apply_rope(k, self.cos[:T], self.sin[:T])
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         return self.proj(out.transpose(1, 2).reshape(B, T, C))
 
 
@@ -65,25 +69,78 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, block_size: int, dim: int = 128, n_heads: int = 4, n_layers: int = 4) -> None:
+    def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
+        vocab_size, block_size, dim, n_heads, n_layers = cfg.vocab_size, cfg.block_size, cfg.dim, cfg.n_heads, cfg.n_layers
+        tie_embeddings = cfg.tie_embeddings
+        assert vocab_size > 0, "ModelConfig.vocab_size must be set from the tokenizer"
+        self.cfg = cfg
         self.block_size = block_size
+        self.dim = dim
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.blocks = nn.Sequential(*[Block(dim, n_heads, block_size) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, vocab_size)
+        self.head = None if tie_embeddings else nn.Linear(dim, vocab_size, bias=False)
+        self.apply(self._init_weights)
+        if self.head is not None:
+            nn.init.zeros_(self.head.weight)  # muP: zero-init readout
+        # Residual-branch output projections get an extra 1/sqrt(2*n_layers) so the residual stream doesn't grow with depth.
+        for name, p in self.named_parameters():
+            if name.endswith(("attn.proj.weight", "mlp.net.2.weight")):
+                p.data.mul_((2 * n_layers) ** -0.5)
+
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        """muP init: hidden weights ~ N(0, 1/fan_in), embedding ~ N(0, 1) (width-independent)."""
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=m.in_features**-0.5)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=1.0)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        logits = self.head(self.ln_f(self.blocks(self.tok_emb(idx))))  # positions come from RoPE in attention
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+        h = self.ln_f(self.blocks(self.tok_emb(idx)))  # positions come from RoPE in attention
+        h = h / self.dim  # muP output multiplier 1/width: logits start near 0 and are O(1/sqrt(width)) at init
+        w = self.tok_emb.weight if self.head is None else self.head.weight
+        if targets is None:
+            return F.linear(h, w), None
+        # Apple's Cut Cross-Entropy: fuses head + loss so the (B*T, vocab) logits are never materialized.
+        # The fused CUDA kernel needs fp16/bf16; other devices use the pure-PyTorch (torch.compile) impl.
+        on_cuda = h.is_cuda
+        dtype = torch.bfloat16 if on_cuda else h.dtype
+        loss = linear_cross_entropy(
+            h.reshape(-1, h.size(-1)).to(dtype),
+            w.to(dtype),
+            targets.reshape(-1),
+            impl="cce" if on_cuda else "torch_compile",
+        )
+        return None, loss
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        eos_id: int | None = None,
+    ) -> torch.Tensor:
+        """Sample continuations. With eos_id, stops once every sequence has emitted it (then pads with eos_id)."""
+        done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
         for _ in range(max_new_tokens):
             logits, _ = self(idx[:, -self.block_size :])
-            probs = F.softmax(logits[:, -1], dim=-1)
-            idx = torch.cat([idx, torch.multinomial(probs, 1)], dim=1)
+            logits = logits[:, -1].float()
+            if temperature == 0:
+                nxt = logits.argmax(-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1:]
+                    logits = logits.masked_fill(logits < kth, float("-inf"))
+                nxt = torch.multinomial(F.softmax(logits, dim=-1), 1)
+            if eos_id is not None:
+                nxt = nxt.masked_fill(done[:, None], eos_id)
+                done |= nxt[:, 0] == eos_id
+            idx = torch.cat([idx, nxt], dim=1)
+            if eos_id is not None and done.all():
+                break
         return idx

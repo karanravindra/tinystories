@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "cut-cross-entropy>=25.1.1",
     "datasets>=5.1.0",
     "gigatoken>=0.11.0",
     "matplotlib>=3.11.2",
@@ -15,11 +16,12 @@ dependencies = [
     "torch>=2.15.0",
     "torchinfo>=1.8.0",
     "tqdm>=4.70.1",
+    "tyro>=1.0.17",
     "wandb>=0.31.0",
 ]
 
 [project.scripts]
-tinystories = "tinystories:main"
+tinystories = "tinystories.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.19,<0.13.0"]

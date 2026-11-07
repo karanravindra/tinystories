@@ -1,32 +1,13 @@
+import functools
+import hashlib
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Protocol
 
 import gigatoken as gt
+import numpy as np
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 EOS = "<|endoftext|>"
-
-
-class Tokenizer_(Protocol):
-    vocab_size: int
-
-    def encode(self, s: str) -> list[int]: ...
-    def decode(self, ids: list[int]) -> str: ...
-
-
-class CharTokenizer:
-    def __init__(self, text: str) -> None:
-        chars = sorted(set(text))
-        self.vocab_size = len(chars)
-        self.stoi = {c: i for i, c in enumerate(chars)}
-        self.itos = {i: c for c, i in self.stoi.items()}
-
-    def encode(self, s: str) -> list[int]:
-        return [self.stoi[c] for c in s if c in self.stoi]
-
-    def decode(self, ids: list[int]) -> str:
-        return "".join(self.itos[i] for i in ids)
 
 
 class BPETokenizer:
@@ -58,6 +39,18 @@ class BPETokenizer:
 
     def save(self, path: str | Path) -> None:
         self.hf.save(str(path))
+
+    @functools.cached_property
+    def sha256(self) -> str:
+        """Identity of the tokenizer, stored with cached tokens so stale caches are detected."""
+        return hashlib.sha256(self.hf.to_str().encode()).hexdigest()
+
+    @functools.cached_property
+    def byte_lengths(self) -> np.ndarray:
+        """UTF-8 bytes each token decodes to (EOS = 0). Used to turn nats/token into bits/byte."""
+        lens = np.array([len(self.gt.decode([i])) for i in range(self.vocab_size)], dtype=np.int64)
+        lens[self.eos_id] = 0
+        return lens
 
     def encode(self, s: str) -> list[int]:
         return self.gt.encode(s).tolist()
