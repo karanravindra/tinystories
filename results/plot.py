@@ -15,7 +15,7 @@ from matplotlib.colors import LinearSegmentedColormap
 
 OUT = Path(__file__).parent
 CACHE = OUT / "runs.json"
-GROUPS = ["vocab-d192-oldlr", "vocab-d192-tunedlr", "lr-d192-v16k-250M", "lr-d192-v16k-500M"]
+GROUPS = ["vocab-d192-oldlr", "vocab-d192-tunedlr", "lr-d192-v16k-250M", "lr-d192-v16k-500M", "shape-v16k-500M"]
 
 # SciencePlots style (https://github.com/garrettj403/SciencePlots). "no-latex": no TeX install needed.
 import scienceplots  # noqa: F401,E402  (registers the styles)
@@ -41,8 +41,10 @@ def fetch() -> list[dict]:
             runs.append({
                 "id": r.id, "name": r.name, "group": r.group,
                 "vocab": c["data"]["vocab_size"], "n_tokens": c["data"]["n_tokens"],
+                "dim": c["model"]["dim"], "n_layers": c["model"]["n_layers"], "params": c.get("params"),
+                "gpu": (r.metadata or {}).get("gpu"),
                 "lr": c["train"]["lr"], "muon_lr": c["train"]["muon_lr"], "seed": c["train"]["seed"],
-                "final_bpb": r.summary["final/val_bpb"],
+                "final_bpb": r.summary.get("final/val_bpb"),  # None if the run stopped before its final eval
                 "step": h["_step"].tolist(), "tokens": h["tokens_seen"].tolist(),
                 "time": h["_runtime"].tolist(), "bpb": h["val/bpb"].tolist(),
             })
@@ -190,9 +192,147 @@ def plot_lr_vs_length(runs):
     save(fig, "lr_vs_length.png")
 
 
+SHAPE_TOKENS = 423_682_911  # one pass over the train split: what the d<=384 runs saw, and every run reached
+
+
+def shape_runs(runs):
+    """{(dim, layers): run} for the width x depth sweep: AdamW 0.02, Muon 0.0018, 16k vocab, seed 0, runs that reached
+    SHAPE_TOKENS. d192/L4 comes from the 500M lr check (same settings). Runs that stopped early are left out."""
+    out = {}
+    for r in runs:
+        if (r["group"] in ("shape-v16k-500M", "lr-d192-v16k-500M") and r["vocab"] == 16384 and r["seed"] == 0
+                and r["lr"] == 0.02 and r["muon_lr"] == 0.0018 and r["tokens"] and r["tokens"][-1] >= SHAPE_TOKENS * 0.999):
+            out[(r["dim"], r["n_layers"])] = r
+    return out
+
+
+def bpb_at(r, tokens):
+    """Subset val bpb at `tokens`, interpolated. With a constant lr and epoch 0 in the same order, a longer run's
+    score at T tokens is what a T-token run would score."""
+    return float(np.interp(tokens, r["tokens"], r["bpb"]))
+
+
+def non_embedding_params(r):
+    return r["params"] - r["vocab"] * r["dim"]  # tied embeddings: one vocab x dim matrix
+
+
+def plot_shape_grid(runs):
+    shapes = shape_runs(runs)
+    dims = sorted({d for d, _ in shapes})
+    depths = sorted({n for _, n in shapes})
+    z = np.full((len(depths), len(dims)), np.nan)
+    for (d, n), r in shapes.items():
+        z[depths.index(n), dims.index(d)] = bpb_at(r, SHAPE_TOKENS)
+    best = np.nanmin(z)
+    cmap = LinearSegmentedColormap.from_list("blue", BLUE_RAMP[::-1])
+    cmap.set_bad(SURFACE)
+    vmax = min(np.nanmax(z), best + 0.12)
+    fig, ax = plt.subplots(figsize=(0.55 * len(dims) + 1.4, 0.32 * len(depths) + 1.0))
+    ax.imshow(np.ma.masked_invalid(z), cmap=cmap, vmin=best, vmax=vmax, aspect="auto", origin="lower")
+    for i in range(len(depths)):
+        for j in range(len(dims)):
+            if np.isnan(z[i, j]):
+                continue
+            dark = (z[i, j] - best) / (vmax - best) < 0.5
+            ax.text(j, i, f"{z[i, j]:.3f}", ha="center", va="center", fontsize=6, family="DejaVu Sans",
+                    color="white" if dark else INK, fontweight="bold" if z[i, j] == best else "normal")
+    ax.set_xticks(range(len(dims)), [str(d) for d in dims])
+    ax.set_yticks(range(len(depths)), [str(n) for n in depths])
+    ax.set_xlabel("Width (model dim)")
+    ax.set_ylabel("Depth (layers)")
+    ax.grid(False)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.minorticks_off()
+    ax.tick_params(length=0)
+    save(fig, "shape_grid.png")
+
+
+def log_ticks(ax, ticks):
+    ax.set_xscale("log")
+    ax.set_xticks(ticks, [f"{t:g}" for t in ticks])
+    ax.minorticks_off()
+
+
+def time_envelope(curves, grid):
+    """Best bpb reachable by each time on `grid`, and which run gives it. curves: {key: (minutes, bpb)}."""
+    best = np.full(len(grid), np.inf)
+    who = [None] * len(grid)
+    for key, (t, b) in curves.items():
+        v = np.interp(grid, t, np.minimum.accumulate(b), left=np.inf)  # after the run ends: its best score so far
+        for i in np.where(v < best)[0]:
+            best[i], who[i] = v[i], key
+    return best, who
+
+
+def envelope_segments(grid, who, min_decades=0.08):
+    """[(start index, end index, key)] of the envelope, with runs that lead only briefly (ties within noise) merged
+    into the neighbour before them."""
+    segs = []
+    for i, w in enumerate(who):
+        if segs and segs[-1][2] == w:
+            segs[-1][1] = i
+        else:
+            segs.append([i, i, w])
+    merged = []
+    for s in segs:
+        short = np.log10(grid[s[1]] / grid[s[0]]) < min_decades
+        if merged and (short or merged[-1][2] == s[2]):
+            merged[-1][1] = s[1]
+        else:
+            merged.append(s)
+    return [tuple(s) for s in merged if s[2] is not None]
+
+
+def plot_shape_size_time(runs):
+    shapes = shape_runs(runs)
+    depths = sorted({n for _, n in shapes})
+    markers = ["o", "s", "^", "D"]
+    fig, axes = plt.subplots(1, 2, figsize=(7, 2.8))
+
+    # (a) Score vs size, one line per depth: at equal size, does the split between width and depth matter?
+    ax = axes[0]
+    for k, n in enumerate(depths):
+        rs = sorted((r for (d, nn), r in shapes.items() if nn == n), key=lambda r: r["dim"])
+        ax.plot([non_embedding_params(r) / 1e6 for r in rs], [bpb_at(r, SHAPE_TOKENS) for r in rs], color=SERIES[k],
+                marker=markers[k], markersize=3.5, label=f"{n}")
+    log_ticks(ax, [0.5, 1, 2, 5, 10, 20])
+    ax.set_xlabel("Parameters excluding embeddings (millions)")
+    ax.set_ylabel("Validation bpb (lower is better)")
+    ax.set_title(f"(a) Score after {SHAPE_TOKENS / 1e6:.0f}M tokens")
+    ax.legend(title="Layers", loc="upper right")
+
+    # (b) Score vs training time: every run in gray, and the best score reachable within each time budget in black.
+    # A run that has ended keeps its last score (you could have stopped there), so it stays in the running.
+    ax = axes[1]
+    curves = {}
+    for key, r in shapes.items():
+        m = np.array(r["tokens"]) <= SHAPE_TOKENS * 1.001
+        curves[key] = (np.array(r["time"])[m] / 60, np.array(r["bpb"])[m])
+        ax.plot(*curves[key], color="0.82", linewidth=0.6, zorder=1)
+    grid = np.geomspace(1, max(t[-1] for t, _ in curves.values()), 400)
+    best, who = time_envelope(curves, grid)
+    n = int(np.nonzero(np.diff(best) < -1e-4)[0][-1]) + 2  # stop where the envelope stops improving (runs ended)
+    grid, best, who = grid[:n], best[:n], who[:n]
+    ax.plot(grid, best, color=INK, linewidth=1.4, zorder=2)
+    for i0, i1, key in envelope_segments(grid, who):
+        x = np.sqrt(grid[i0] * grid[i1])  # middle on the log axis
+        y = np.interp(x, grid, best)
+        ax.plot(grid[i0], best[i0], marker="|", color=INK, markersize=5, zorder=3)
+        ax.annotate(f"d{key[0]}/L{key[1]}", (x, y), textcoords="offset points", xytext=(-5, -5),
+                    ha="right", va="top", fontsize=6, family="DejaVu Sans", color=INK)
+    log_ticks(ax, [1, 2, 5, 10, 20])
+    ax.set_ylim(0.53, 0.8)
+    ax.set_xlabel("Training time on an RTX 5070 Ti (minutes)")
+    ax.set_title("(b) Best shape at each time budget")
+    save(fig, "shape_size_time.png")
+
+
 if __name__ == "__main__":
     runs = json.loads(CACHE.read_text()) if "--cached" in sys.argv else fetch()
     plot_vocab(runs)
     plot_heatmap(lr_grid(runs, 250_000_000), "Learning-rate search at 250M tokens (final bpb)", "lr_250M.png")
     plot_heatmap(lr_grid(runs, 500_000_000), "Learning-rate check at 500M tokens (final bpb)", "lr_500M.png")
     plot_lr_vs_length(runs)
+    plot_shape_grid(runs)
+    plot_shape_size_time(runs)
