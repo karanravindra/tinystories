@@ -38,9 +38,9 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     optimizer: Literal["muon", "adamw"] = "muon"
-    lr: float = 1e-3
+    lr: float = 0.02
     """AdamW lr (also embeddings/head/norms under muon)"""
-    muon_lr: float = 0.02
+    muon_lr: float = 0.0018
     """Muon lr for hidden weight matrices"""
     batch_size: int = 64
     warmup_frac: float = 0.02
