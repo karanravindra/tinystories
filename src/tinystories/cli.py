@@ -1,6 +1,8 @@
 """`tinystories train [--model.dim 384 ...]` and `tinystories sample <run dir>`."""
 
 import time
+from dataclasses import asdict
+from pathlib import Path
 
 import torch
 import tyro
@@ -11,7 +13,15 @@ from tinystories.data import Batcher, load_or_train_tokenizer, load_tokens
 from tinystories.model import GPT
 from tinystories.sample import SampleArgs, generate_text, sample
 from tinystories.tokenizer import BPETokenizer
-from tinystories.train import TrainResult, plot_losses, save_checkpoint, train
+from tinystories.train import (
+    TrainResult,
+    TrainState,
+    plot_losses,
+    read_state,
+    save_checkpoint,
+    train,
+    write_state,
+)
 
 
 def prepare_data(cfg: RunConfig) -> tuple[BPETokenizer, Batcher, Batcher]:
@@ -32,30 +42,82 @@ def build_model(cfg: RunConfig, example_input: torch.Tensor | None = None) -> GP
     return model
 
 
-def init_wandb(cfg: RunConfig, model: GPT):
+def init_wandb(cfg: RunConfig, model: GPT, resume_id: str | None = None, extra: dict | None = None):
+    """A new wandb run, or with resume_id, that run continued (renamed to cfg.wandb_name, config updated)."""
     if not cfg.wandb:
         return None
     import wandb
 
-    run = wandb.init(
-        project=cfg.wandb_project,
-        name=cfg.wandb_name,
-        config={**cfg.to_dict(), "params": sum(p.numel() for p in model.parameters())},
-    )
-    for metric in ("train/loss", "val/loss", "val/bpb", "lr"):
+    config = {**cfg.to_dict(), "params": sum(p.numel() for p in model.parameters()), **(extra or {})}
+    if resume_id is None:
+        run = wandb.init(project=cfg.wandb_project, name=cfg.wandb_name, config=config)
+    else:
+        run = wandb.init(
+            project=cfg.wandb_project, id=resume_id, resume="must", name=cfg.wandb_name, config=config,
+            allow_val_change=True,
+        )
+    for metric in ("train/loss", "val/loss", "val/bpb", "lr", "train/seconds"):
         run.define_metric(metric, step_metric="tokens_seen")
     return run
 
 
+def load_resume(cfg: RunConfig, train_data: Batcher, n_steps: int) -> tuple[TrainState, dict, str | None]:
+    """State, weights and wandb run id to continue from cfg.resume, after checking the run is the same apart from
+    length and lrs."""
+    state, weights, old, old_windows, wandb_id = read_state(Path(cfg.resume), cfg.device)
+    same = {
+        "model": (asdict(old.model), asdict(cfg.model)),
+        "vocab": (old.data.vocab_size, cfg.data.vocab_size),
+        "max story tokens": (old.data.max_story_tokens, cfg.data.max_story_tokens),
+        "optimizer": (old.train.optimizer, cfg.train.optimizer),
+        "batch size": (old.train.batch_size, cfg.train.batch_size),
+        "seed": (old.train.seed, cfg.train.seed),
+        "train windows (data order)": (old_windows, train_data.n_windows),
+    }
+    diffs = [f"{k}: {a} -> {b}" for k, (a, b) in same.items() if a != b]
+    if diffs:
+        raise SystemExit(f"can't resume {cfg.resume}, settings differ:\n  " + "\n  ".join(diffs))
+    if n_steps < state.step:
+        raise SystemExit(f"{cfg.resume} is already at step {state.step}, past this run's {n_steps} steps")
+    for k in ("lr", "muon_lr", "warmup_frac", "decay_frac"):
+        a, b = getattr(old.train, k), getattr(cfg.train, k)
+        if a != b:
+            print(f"warning: {k} changes on resume, {a} -> {b}")
+    if cfg.wandb and wandb_id is None:
+        print("warning: the run being resumed had no wandb run; logging to a new one, whose time axis starts at 0")
+    return state, weights, wandb_id
+
+
+def keep_old_final(run, tokens: int) -> None:
+    """Before a finished run continues, copy its final full-val numbers to final_at_<tokens>M/*, so they survive."""
+    for k in ("val_loss", "val_bpb"):
+        v = run.summary.get(f"final/{k}")
+        if v is not None:
+            run.summary[f"final_at_{tokens // 1_000_000}M/{k}"] = v
+
+
 def run_train(cfg: RunConfig) -> tuple[GPT, TrainResult]:
     tokenizer, train_data, val_data = prepare_data(cfg)
+    n_steps = train_data.n_steps(cfg.data.n_tokens)
     model = build_model(cfg, next(val_data.eval_batches(1))[0])
-    run = init_wandb(cfg, model)
+    resume, resume_id, extra = None, None, None
+    if cfg.resume is not None:
+        resume, weights, resume_id = load_resume(cfg, train_data, n_steps)
+        model.load_state_dict(weights)
+        extra = {"resumed_from": Path(cfg.resume).name, "resumed_at_step": resume.step}
+    run = init_wandb(cfg, model, resume_id, extra)
+    if run is not None and resume is not None:
+        keep_old_final(run, resume.step * train_data.block_size * train_data.batch_size)
     run_name = cfg.wandb_name or (run.name if run is not None else time.strftime("%Y%m%d-%H%M%S"))
-
-    result = train(model, train_data, val_data, tokenizer, cfg.train, run=run)
-
     out_dir = cfg.out_dir / run_name
+
+    def save_state(state: TrainState) -> None:
+        write_state(out_dir, model, state, cfg, train_data.n_windows, None if run is None else run.id)
+
+    result = train(
+        model, train_data, val_data, tokenizer, cfg.train, n_steps, run=run, resume=resume, save_state=save_state
+    )
+
     save_checkpoint(out_dir, model, cfg, tokenizer, result)
     plot_losses(result, train_data.block_size * train_data.batch_size, out_dir / "loss.png")
     print(f"saved model, tokenizer, config and loss plot to {out_dir}/")

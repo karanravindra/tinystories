@@ -25,7 +25,7 @@ class ModelConfig:
 @dataclass
 class DataConfig:
     n_tokens: int = 500_000_000
-    """train tokens from the train split, seen once (capped at what the dataset holds)"""
+    """total train tokens; past what the train split holds, it repeats in reshuffled epochs"""
     vocab_size: int = 8192
     """BPE vocab size"""
     max_story_tokens: int = 1024
@@ -51,6 +51,8 @@ class TrainConfig:
     """steps between subset val evals (0 disables; a full val eval always runs at the end)"""
     eval_batches: int = 20
     log_every: int = 50
+    save_every: int = 1000
+    """steps between resumable state saves (<run dir>/state.pt; 0 = only at the end)"""
     seed: int = 0
 
 
@@ -67,11 +69,14 @@ class RunConfig:
     wandb_project: str = "tinystories"
     wandb_name: str | None = None
     """run name (also the output subdir); default: wandb's name, else a timestamp"""
+    resume: Path | None = None
+    """run dir to continue from (its state.pt): same model and data settings, --data.n-tokens is the new total"""
 
     def to_dict(self) -> dict:
         """JSON-safe dict (Paths -> str), so checkpoints load with torch.load(weights_only=True)."""
         d = asdict(self)
         d["out_dir"] = str(self.out_dir)
+        d["resume"] = None if self.resume is None else str(self.resume)
         d["data"]["cache_dir"] = str(self.data.cache_dir)
         return d
 
@@ -81,5 +86,9 @@ class RunConfig:
             model=ModelConfig(**d["model"]),
             data=DataConfig(**{**d["data"], "cache_dir": Path(d["data"]["cache_dir"])}),
             train=TrainConfig(**d["train"]),
-            **{k: Path(v) if k == "out_dir" else v for k, v in d.items() if k not in ("model", "data", "train")},
+            **{
+                k: Path(v) if k in ("out_dir", "resume") and v is not None else v
+                for k, v in d.items()
+                if k not in ("model", "data", "train")
+            },
         )

@@ -2,7 +2,6 @@ import functools
 import itertools
 import json
 import shutil
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -136,7 +135,7 @@ def load_tokens(
     data = cache.load()
     if n_tokens is not None:
         if len(data) < n_tokens:
-            warnings.warn(f"requested {n_tokens:,} {split} tokens, dataset has {len(data):,}; using all of it")
+            print(f"requested {n_tokens:,} {split} tokens, dataset has {len(data):,}; training repeats it in reshuffled epochs")
         data = data[:n_tokens]
     print(f"loaded {split} tokens {cache.bin} ({len(data):,} tokens)")
     return data
@@ -166,11 +165,24 @@ class Batcher:
         w = w.to(self.device, non_blocking=self.pin)
         return w[:, :-1], w[:, 1:]
 
-    def train_batches(self):
-        """One pass: windows shuffled (seeded), each token used once."""
-        g = torch.Generator().manual_seed(self.seed)
-        starts = torch.randperm(self.n_windows, generator=g) * self.block_size
-        for b in range(self.steps_per_epoch):
+    def n_steps(self, n_tokens: int) -> int:
+        """Training steps for n_tokens: one epoch if the stream holds them all, else enough epochs to reach n_tokens."""
+        tokens_per_step = self.block_size * self.batch_size
+        return max(self.steps_per_epoch, n_tokens // tokens_per_step)
+
+    def train_batches(self, n_steps: int, start_step: int = 0):
+        """Batches for steps start_step..n_steps-1 (0-based).
+
+        Each epoch is a fresh seeded shuffle of the windows, each token used once per epoch. Epoch 0 uses
+        `seed` itself, so a run's order is a prefix of any longer run's, and resuming continues it exactly.
+        """
+        epoch = None
+        for s in range(start_step, n_steps):
+            e, b = divmod(s, self.steps_per_epoch)
+            if e != epoch:
+                epoch = e
+                g = torch.Generator().manual_seed(self.seed + 1_000_003 * e)
+                starts = torch.randperm(self.n_windows, generator=g) * self.block_size
             yield self._stack(starts[b * self.batch_size : (b + 1) * self.batch_size])
 
     def eval_batches(self, n: int | None = None):

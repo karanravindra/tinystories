@@ -1,6 +1,9 @@
 import json
 import math
+import signal
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,8 +17,18 @@ from tinystories.tokenizer import BPETokenizer
 
 
 def build_optimizers(model: GPT, cfg: TrainConfig) -> list[torch.optim.Optimizer]:
+    """Optimizers, each param group tagged with its peak lr ("base_lr") for the schedule."""
     if cfg.optimizer == "adamw":
-        return [torch.optim.AdamW(model.parameters(), lr=cfg.lr)]
+        opts = [torch.optim.AdamW(model.parameters(), lr=cfg.lr)]
+    else:
+        opts = _muon_and_adamw(model, cfg)
+    for opt in opts:
+        for g in opt.param_groups:
+            g["base_lr"] = g["lr"]
+    return opts
+
+
+def _muon_and_adamw(model: GPT, cfg: TrainConfig) -> list[torch.optim.Optimizer]:
 
     # Muon only handles 2D hidden weight matrices. Embeddings, the output head,
     # norms and biases go to AdamW.
@@ -70,27 +83,63 @@ class TrainResult:
     final_val_bpb: float = float("nan")
 
 
+@contextmanager
+def stop_requests() -> Iterator[list[int]]:
+    """Turn Ctrl-C / SIGTERM into a request (the signal number, appended to the yielded list) that the training loop
+    honors after the current step, so it can save a resumable state first. A second signal stops at once."""
+    requested: list[int] = []
+
+    def handler(signum, frame):
+        if requested:
+            raise KeyboardInterrupt
+        requested.append(signum)
+        print(f"\n{signal.Signals(signum).name}: stopping after this step (saving state first); again to force", flush=True)
+
+    old = {sig: signal.signal(sig, handler) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield requested
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h)
+
+
+@dataclass
+class TrainState:
+    """Where a run is, for resuming: optimizer states, steps done, history so far and train seconds so far."""
+
+    step: int = 0
+    optimizers: list[dict] = field(default_factory=list)
+    result: TrainResult = field(default_factory=TrainResult)
+    train_seconds: float = 0.0
+
+
 def train(
     model: GPT,
     train_data: Batcher,
     val_data: Batcher,
     tokenizer: BPETokenizer,
     cfg: TrainConfig,
+    n_steps: int,
     run=None,
+    resume: TrainState | None = None,
+    save_state: Callable[[TrainState], None] | None = None,
 ) -> TrainResult:
-    """Single pass over the train data (no repeated epochs), then a full eval on the validation split.
+    """n_steps of training (repeating the train data in reshuffled epochs if needed), then a full val eval.
 
-    `run` is an optional wandb run.
+    `run` is an optional wandb run (for a resumed run, the same wandb run resumed). `resume` continues a run from its
+    saved state (model weights must already be loaded); `save_state` is called every cfg.save_every steps and at
+    the end.
     """
     # Optimizers use the uncompiled model (compiled wrappers prefix param names with `_orig_mod.`).
     optimizers = build_optimizers(model, cfg)
-    n_steps = train_data.steps_per_epoch
-    schedulers = [
-        torch.optim.lr_scheduler.LambdaLR(
-            opt, lambda s: lr_factor(s, n_steps, cfg.warmup_frac, cfg.decay_frac)
-        )
-        for opt in optimizers
-    ]
+    start_step, result, prior_seconds = 0, TrainResult(), 0.0
+    if resume is not None:
+        for opt, sd in zip(optimizers, resume.optimizers, strict=True):
+            opt.load_state_dict(sd)
+            for g in opt.param_groups:  # load_state_dict restores the old lrs; the schedule uses this run's
+                g["base_lr"] = cfg.muon_lr if isinstance(opt, torch.optim.Muon) else cfg.lr
+        start_step, result, prior_seconds = resume.step, resume.result, resume.train_seconds
+        print(f"resumed at step {start_step}/{n_steps} ({prior_seconds / 60:.1f} train minutes so far)", flush=True)
     compiled = torch.compile(model, mode=cfg.compile_mode) if cfg.compile_mode != "none" else model
     device = next(model.parameters()).device
     byte_lengths = torch.from_numpy(tokenizer.byte_lengths).to(device)
@@ -100,7 +149,6 @@ def train(
             return compiled(x, y)
 
     tokens_per_step = train_data.block_size * train_data.batch_size
-    result = TrainResult()
     # Per-step logs wait here with the loss still on the GPU; they're synced once per log_every steps.
     pending: list[tuple[dict, torch.Tensor]] = []
 
@@ -112,7 +160,7 @@ def train(
             if run is not None:
                 run.log(log)
         pending.clear()
-        steps_per_sec = step / elapsed
+        steps_per_sec = (step - start_step) / elapsed
         eta = int((n_steps - step) / steps_per_sec)
         msg = f"step {step}/{n_steps} | loss {result.losses[-1]:.4f}"
         if result.val:
@@ -120,30 +168,51 @@ def train(
         msg += f" | {steps_per_sec:.2f} step/s | eta {eta // 3600}:{eta % 3600 // 60:02d}:{eta % 60:02d}"
         print(msg, flush=True)
 
+    def snapshot(step: int) -> TrainState:
+        return TrainState(step, [opt.state_dict() for opt in optimizers], result, prior_seconds + time.time() - t0)
+
     model.train()
     t0 = time.time()
-    for step, (x, y) in enumerate(train_data.train_batches(), start=1):
-        _, loss = fwd(x, y)
-        for opt in optimizers:
-            opt.zero_grad(set_to_none=True)
-        loss.backward()
-        lr = optimizers[0].param_groups[0]["lr"]
-        for opt in optimizers:
-            opt.step()
-        for sched in schedulers:
-            sched.step()
-        # clone: with CUDA graphs (reduce-overhead) the output buffer is overwritten by the next step
-        log = {"tokens_seen": step * tokens_per_step, "lr": lr}
-        pending.append((log, loss.detach().clone()))
+    batches = train_data.train_batches(n_steps, start_step)
+    with stop_requests() as stop:
+        for step, (x, y) in enumerate(batches, start=start_step + 1):
+            _, loss = fwd(x, y)
+            for opt in optimizers:
+                opt.zero_grad(set_to_none=True)
+            loss.backward()
+            f = lr_factor(step - 1, n_steps, cfg.warmup_frac, cfg.decay_frac)
+            for opt in optimizers:
+                for g in opt.param_groups:
+                    g["lr"] = g["base_lr"] * f
+                opt.step()
+            lr = optimizers[0].param_groups[0]["lr"]
+            # clone: with CUDA graphs (reduce-overhead) the output buffer is overwritten by the next step
+            log = {"tokens_seen": step * tokens_per_step, "lr": lr, "train/seconds": prior_seconds + time.time() - t0}
+            pending.append((log, loss.detach().clone()))
 
-        if cfg.eval_every > 0 and (step % cfg.eval_every == 0 or step == n_steps):
-            val_loss, val_bpb = evaluate(fwd, val_data.eval_batches(cfg.eval_batches), byte_lengths)
-            result.val.append((step, val_loss, val_bpb))
-            log.update({"val/loss": val_loss, "val/bpb": val_bpb})
+            if cfg.eval_every > 0 and (step % cfg.eval_every == 0 or step == n_steps):
+                val_loss, val_bpb = evaluate(fwd, val_data.eval_batches(cfg.eval_batches), byte_lengths)
+                result.val.append((step, val_loss, val_bpb))
+                log.update({"val/loss": val_loss, "val/bpb": val_bpb})
 
-        if step % cfg.log_every == 0 or step == n_steps:
-            flush(step, time.time() - t0)
+            if step % cfg.log_every == 0 or step == n_steps:
+                flush(step, time.time() - t0)
 
+            if save_state is not None and cfg.save_every > 0 and step % cfg.save_every == 0 and step < n_steps:
+                if pending:
+                    flush(step, time.time() - t0)
+                save_state(snapshot(step))
+
+            if stop and step < n_steps:
+                if pending:
+                    flush(step, time.time() - t0)
+                if save_state is not None:
+                    save_state(snapshot(step))
+                    print(f"saved state at step {step}; continue with --resume", flush=True)
+                raise SystemExit(128 + stop[0])  # 130 for Ctrl-C, 143 for SIGTERM; wandb flushes on the way out
+
+    if save_state is not None:
+        save_state(snapshot(n_steps))
     result.final_val_loss, result.final_val_bpb = evaluate(fwd, val_data.eval_batches(), byte_lengths)
     print(f"final full-val loss {result.final_val_loss:.4f} | {result.final_val_bpb:.4f} bpb", flush=True)
     if run is not None:
@@ -159,6 +228,36 @@ def save_checkpoint(out_dir: Path, model: GPT, cfg: RunConfig, tokenizer: BPETok
     torch.save({"model": model.state_dict(), "config": cfg.to_dict(), "final": final}, out_dir / "model.pt")
     tokenizer.save(out_dir / "tokenizer.json")
     (out_dir / "config.json").write_text(json.dumps({"config": cfg.to_dict(), "final": final}, indent=2))
+
+
+def write_state(
+    out_dir: Path, model: GPT, state: TrainState, cfg: RunConfig, train_windows: int, wandb_id: str | None
+) -> None:
+    """Save `state` with its run config to <out_dir>/state.pt (via a temp file, so a crash never leaves half a file)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    r = state.result
+    blob = {
+        "model": model.state_dict(),
+        "step": state.step,
+        "optimizers": state.optimizers,
+        "train_seconds": state.train_seconds,
+        "losses": r.losses,
+        "val": r.val,
+        "config": cfg.to_dict(),
+        "train_windows": train_windows,  # the shuffled pool; resuming needs the same one to continue the order
+        "wandb_id": wandb_id,  # resuming continues this wandb run, so its curves (and _runtime) carry on
+    }
+    tmp = out_dir / "state.pt.tmp"
+    torch.save(blob, tmp)
+    tmp.replace(out_dir / "state.pt")
+
+
+def read_state(run_dir: Path, device: str) -> tuple[TrainState, dict, RunConfig, int, str | None]:
+    """(train state, model weights, run config, train windows, wandb run id) saved by a run, for resuming it."""
+    blob = torch.load(run_dir / "state.pt", map_location=device, weights_only=True)
+    result = TrainResult(losses=blob["losses"], val=[tuple(v) for v in blob["val"]])
+    state = TrainState(blob["step"], blob["optimizers"], result, blob["train_seconds"])
+    return state, blob["model"], RunConfig.from_dict(blob["config"]), blob["train_windows"], blob["wandb_id"]
 
 
 def load_checkpoint(ckpt_dir: str | Path, device: str = "cpu") -> tuple[GPT, BPETokenizer, RunConfig]:
