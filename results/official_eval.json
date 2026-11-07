@@ -1,0 +1,51 @@
+{
+ "n_stories": 21427,
+ "n_bytes": 17858502,
+ "results": {
+  "ours-v16k": {
+   "bpb": 0.6027577765082132,
+   "params": 4918656,
+   "non_emb_params": 1772928
+  },
+  "ours-v32k": {
+   "bpb": 0.6006325807783246,
+   "params": 8064384,
+   "non_emb_params": 1772928
+  },
+  "TinyStories-1M": {
+   "bpb": 0.7895494203029157,
+   "params": 3745984,
+   "non_emb_params": 398464
+  },
+  "TinyStories-3M": {
+   "bpb": 0.623904116235886,
+   "params": 8278400,
+   "non_emb_params": 1583360
+  },
+  "TinyStories-8M": {
+   "bpb": 0.5376293782899978,
+   "params": 19702528,
+   "non_emb_params": 6312448
+  },
+  "TinyStories-28M": {
+   "bpb": 0.46956169523267427,
+   "params": 51987968,
+   "non_emb_params": 25207808
+  },
+  "TinyStories-33M": {
+   "bpb": 0.4684534224140944,
+   "params": 68514048,
+   "non_emb_params": 28343808
+  },
+  "TinyStories-1Layer-21M": {
+   "bpb": 0.5798848360425707,
+   "params": 66155520,
+   "non_emb_params": 12595200
+  },
+  "TinyStories-2Layers-33M": {
+   "bpb": 0.49362712269880465,
+   "params": 78748672,
+   "non_emb_params": 25188352
+  }
+ }
+}

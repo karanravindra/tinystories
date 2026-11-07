@@ -98,3 +98,30 @@ wandb group: `vocab-d192-tunedlr` (16k run in `lr-d192-v16k-500M`)
 - **Bigger is now slightly better all the way to 32k**, but with diminishing returns: 4k → 8k gains 0.023, 8k → 16k gains 0.007, 16k → 32k gains 0.003. The last step is about the size of seed noise.
 - **If training time is the limit, 8k or 16k is best.** Each 32k step is about 30% slower than a 16k step. After 4 minutes of training, 8k (0.637) and 16k (0.638) lead 32k (0.646) and 4k (0.659).
 - **Caveat:** we tuned the learning rate at 16k and used it for every vocabulary size. The best AdamW lr may be different for very small or very large vocabularies, since it trains the embeddings.
+
+## 5. Comparison with the official TinyStories models (2026-11-07)
+
+**Question:** How does our best model compare to the models released with the TinyStories paper (Eldan & Li, 2023)?
+
+We scored our two best models and the seven official models on the same validation stories. Each story is scored on its own, from the start, using bits per byte, so the different tokenizers don't matter. We used the 21,427 stories (97% of the split) that fit in our 512-token context. These numbers are lower than our training-time bpb because there every 512-token window starts mid-story, with no earlier context.
+
+Script: `results/eval_official.py`. Raw numbers: `results/official_eval.json`. Samples from every model on the same prompts: `results/generations.md`.
+
+| Model | bpb (lower is better) | Parameters | Parameters excluding embeddings |
+|---|---|---|---|
+| TinyStories-33M | **0.468** | 68.5M | 28.3M |
+| TinyStories-28M | 0.470 | 52.0M | 25.2M |
+| TinyStories-2Layers-33M | 0.494 | 78.7M | 25.2M |
+| TinyStories-8M | 0.538 | 19.7M | 6.3M |
+| TinyStories-1Layer-21M | 0.580 | 66.2M | 12.6M |
+| **Ours, 32k vocab** | **0.601** | 8.1M | 1.8M |
+| **Ours, 16k vocab** | 0.603 | 4.9M | 1.8M |
+| TinyStories-3M | 0.624 | 8.3M | 1.6M |
+| TinyStories-1M | 0.790 | 3.7M | 0.4M |
+
+**What we learned:**
+- **Our model beats the official model of the same size.** TinyStories-3M has about the same number of weights as our 32k model (8.3M vs 8.1M in total, 1.6M vs 1.8M outside the embeddings). Ours scores 0.601 vs 0.624. Our 16k model does as well with 40% fewer weights.
+- **The bigger official models are still much better.** The 8M model (3.5× our non-embedding size) scores 0.538, and the 28M–33M models score about 0.47. To get there we need a bigger model, not more tuning.
+- **Generations:** ours write fluent sentences and proper story shapes ("Once upon a time… One day… From that day on…"). Like TinyStories-3M, they lose track of the plot: objects and characters change halfway through, and events don't follow from each other. The 28M and 33M models keep a consistent plot and characters, and their stories make sense from start to end.
+- **The 1Layer-21M and 2Layers-33M models seem to have been trained on data with story metadata.** They often write `Summary:` / `Features:` lines, which probably costs them a little bpb on plain stories.
+- **The dataset contains some garbled characters** (for example `â€™` instead of `’`), and our models sometimes reproduce them.
