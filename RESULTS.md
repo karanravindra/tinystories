@@ -119,9 +119,25 @@ Script: `results/eval_official.py`. Raw numbers: `results/official_eval.json`. S
 | TinyStories-3M | 0.624 | 8.3M | 1.6M |
 | TinyStories-1M | 0.790 | 3.7M | 0.4M |
 
+How the models are built, from each model's `config.json` on Hugging Face (`roneneldan/TinyStories-*`). Width is the size of each token's vector inside the model, depth is the number of layers, and a head is one of the parallel attention units in a layer.
+
+| Model | Width | Depth (layers) | Heads | Head size | Vocab |
+|---|---|---|---|---|---|
+| TinyStories-33M | 768 | 4 | 16 | 48 | 50,257 |
+| TinyStories-28M | 512 | 8 | 16 | 32 | 50,257 |
+| TinyStories-2Layers-33M | 1024 | 2 | 16 | 64 | 50,257 |
+| TinyStories-8M | 256 | 8 | 16 | 16 | 50,257 |
+| TinyStories-1Layer-21M | 1024 | 1 | 16 | 64 | 50,257 |
+| TinyStories-3M | 128 | 8 | 16 | 8 | 50,257 |
+| TinyStories-1M | 64 | 8 | 16 | 4 | 50,257 |
+| Ours | 192 | 4 | 3 | 64 | 16,384 or 32,768 |
+
+All the official models are GPT-Neo models with the GPT-2 tokenizer, learned position embeddings (up to 2,048 positions), a GELU MLP 4× the width, and no dropout. Their layers alternate between full attention and local attention, which only looks at the previous 256 tokens. (The 1-layer model has only one full-attention layer.) Ours uses rotary position embeddings (RoPE), full attention in every layer, the same GELU MLP 4× the width, tied input and output embeddings, and a 512-token context.
+
 **What we learned:**
 - **Our model beats the official model of the same size.** TinyStories-3M has about the same number of weights as our 32k model (8.3M vs 8.1M in total, 1.6M vs 1.8M outside the embeddings). Ours scores 0.601 vs 0.624. Our 16k model does as well with 40% fewer weights.
 - **The bigger official models are still much better.** The 8M model (3.5× our non-embedding size) scores 0.538, and the 28M–33M models score about 0.47. To get there we need a bigger model, not more tuning.
 - **Generations:** ours write fluent sentences and proper story shapes ("Once upon a time… One day… From that day on…"). Like TinyStories-3M, they lose track of the plot: objects and characters change halfway through, and events don't follow from each other. The 28M and 33M models keep a consistent plot and characters, and their stories make sense from start to end.
+- **Above about 4 layers, total size matters more than how it is split between width and depth.** The two best models are shaped in opposite ways: 33M is wide and shallow (width 768, 4 layers), and 28M is half as wide and twice as deep (512, 8 layers). They score almost the same (0.468 vs 0.470). Very shallow models do worse: 2Layers-33M has as many weights outside the embeddings as 28M (25.2M) but scores 0.494 vs 0.470. The models also differ in training data and tokenizer, so this is only suggestive.
 - **The 1Layer-21M and 2Layers-33M models seem to have been trained on data with story metadata.** They often write `Summary:` / `Features:` lines, which probably costs them a little bpb on plain stories.
 - **The dataset contains some garbled characters** (for example `â€™` instead of `’`), and our models sometimes reproduce them.
