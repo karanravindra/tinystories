@@ -86,6 +86,9 @@ class RunConfig:
     wandb_project: str = "tinystories"
     wandb_name: str | None = None
     """run name (also the output subdir); default: wandb's name, else a timestamp"""
+    wandb_checkpoints: Literal["none", "model", "all"] = "model"
+    """what to upload to wandb as artifacts (with --wandb): "model" = the final model dir (model.pt, tokenizer.json,
+    config.json); "all" = that plus every state save (state.pt and snapshots), so a run can resume on another machine"""
     resume: Path | None = None
     """run dir to continue from (its state.pt): same model and data settings, --data.n-tokens is the new total"""
     branch_from: Path | None = None

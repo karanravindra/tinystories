@@ -1,5 +1,6 @@
 """`tinystories train [--model.dim 384 ...]` and `tinystories sample <run dir>`."""
 
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -61,6 +62,32 @@ def init_wandb(cfg: RunConfig, model: GPT, resume_id: str | None = None, extra: 
     for metric in ("train/loss", "val/loss", "val/bpb", "lr", "train/seconds"):
         run.define_metric(metric, step_metric="tokens_seen")
     return run
+
+
+def artifact_name(run_name: str, kind: str) -> str:
+    """A wandb artifact name (letters, digits, - _ . only) for this run's `kind` of checkpoint."""
+    return re.sub(r"[^\w.-]", "_", f"{run_name}-{kind}")
+
+
+def upload_model(run, run_name: str, out_dir: Path, result: TrainResult) -> None:
+    """Log the final model dir as a `model` artifact (download with `wandb artifact get` and point sample at it)."""
+    import wandb
+
+    meta = {"final_val_loss": result.final_val_loss, "final_val_bpb": result.final_val_bpb}
+    art = wandb.Artifact(artifact_name(run_name, "model"), type="model", metadata=meta)
+    for f in ("model.pt", "tokenizer.json", "config.json"):
+        art.add_file(str(out_dir / f))
+    run.log_artifact(art, aliases=["latest", "final"])
+
+
+def upload_state(run, run_name: str, path: Path, step: int) -> None:
+    """Log a resumable state file as a `checkpoint` artifact version, aliased by step and file name."""
+    import wandb
+
+    art = wandb.Artifact(artifact_name(run_name, "state"), type="checkpoint", metadata={"step": step})
+    art.add_file(str(path), name="state.pt")  # copied to wandb's staging dir, so later overwrites of path are safe
+    aliases = ["latest", f"step-{step}"] + ([path.stem] if path.name != "state.pt" else [])
+    run.log_artifact(art, aliases=aliases)
 
 
 def load_resume(
@@ -138,12 +165,16 @@ def run_train(cfg: RunConfig) -> tuple[GPT, TrainResult]:
 
     def save_state(state: TrainState, name: str = "state.pt") -> None:
         write_state(out_dir, model, state, cfg, train_data.n_windows, None if run is None else run.id, name)
+        if run is not None and cfg.wandb_checkpoints == "all":
+            upload_state(run, run_name, out_dir / name, state.step)
 
     result = train(
         model, train_data, val_data, tokenizer, cfg.train, n_steps, run=run, resume=resume, save_state=save_state
     )
 
     save_checkpoint(out_dir, model, cfg, tokenizer, result)
+    if run is not None and cfg.wandb_checkpoints != "none":
+        upload_model(run, run_name, out_dir, result)
     plot_losses(result, train_data.block_size * train_data.batch_size, out_dir / "loss.png")
     print(f"saved model, tokenizer, config and loss plot to {out_dir}/")
 

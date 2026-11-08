@@ -32,6 +32,7 @@ EXTRA_ARGS=(--model.mlp swiglu --model.qk-norm --model.doc-mask --model.value-em
 SNAPSHOT_STEPS=()
 STOP_AFTER=0          # >0: a parent run stops after this step (saving state-<step>.pt), leaving the rest to branches
 BRANCH_FROM=""
+WANDB_CHECKPOINTS=model  # upload to wandb: model = final model dir; all = also every state save (resume elsewhere); none
 
 # Optional overrides: SWEEP_ENV=file.sh bash scratchpad.sh sources file.sh here, so two sweeps can run side by side
 # with different settings without editing this file.
@@ -117,6 +118,7 @@ for DECAY_FRAC in "${DECAY_FRACS[@]}"; do
       --wandb \
       --wandb-project tinystories \
       --wandb-name "${NAME}" \
+      --wandb-checkpoints ${WANDB_CHECKPOINTS} \
       --model.block-size 512 \
       --model.dim ${DIM} \
       --model.n-heads ${N_HEADS} \
