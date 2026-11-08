@@ -16,6 +16,7 @@ from tinystories.tokenizer import BPETokenizer
 from tinystories.train import (
     TrainResult,
     TrainState,
+    lr_factor,
     plot_losses,
     read_state,
     save_checkpoint,
@@ -28,6 +29,7 @@ def prepare_data(cfg: RunConfig) -> tuple[BPETokenizer, Batcher, Batcher]:
     """Tokenizer, train batches (n_tokens of the train split) and val batches (the whole validation split)."""
     tokenizer, tok_dir = load_or_train_tokenizer(cfg.data)
     cfg.model.vocab_size = tokenizer.vocab_size
+    cfg.model.eos_id = tokenizer.eos_id
     train_tokens = load_tokens("train", tokenizer, tok_dir, cfg.data.n_tokens, cfg.data.max_story_tokens)
     val_tokens = load_tokens("validation", tokenizer, tok_dir)
     args = (cfg.model.block_size, cfg.train.batch_size, cfg.device, cfg.train.seed)
@@ -61,10 +63,13 @@ def init_wandb(cfg: RunConfig, model: GPT, resume_id: str | None = None, extra: 
     return run
 
 
-def load_resume(cfg: RunConfig, train_data: Batcher, n_steps: int) -> tuple[TrainState, dict, str | None]:
-    """State, weights and wandb run id to continue from cfg.resume, after checking the run is the same apart from
-    length and lrs."""
-    state, weights, old, old_windows, wandb_id = read_state(Path(cfg.resume), cfg.device)
+def load_resume(
+    cfg: RunConfig, train_data: Batcher, n_steps: int, source: Path | None = None
+) -> tuple[TrainState, dict, str | None]:
+    """State, weights and wandb run id to continue from `source` (default cfg.resume), after checking the run is the
+    same apart from length and lrs."""
+    source = Path(source if source is not None else cfg.resume)
+    state, weights, old, old_windows, wandb_id = read_state(source, cfg.device)
     same = {
         "model": (asdict(old.model), asdict(cfg.model)),
         "vocab": (old.data.vocab_size, cfg.data.vocab_size),
@@ -76,9 +81,22 @@ def load_resume(cfg: RunConfig, train_data: Batcher, n_steps: int) -> tuple[Trai
     }
     diffs = [f"{k}: {a} -> {b}" for k, (a, b) in same.items() if a != b]
     if diffs:
-        raise SystemExit(f"can't resume {cfg.resume}, settings differ:\n  " + "\n  ".join(diffs))
+        raise SystemExit(f"can't resume {source}, settings differ:\n  " + "\n  ".join(diffs))
     if n_steps < state.step:
-        raise SystemExit(f"{cfg.resume} is already at step {state.step}, past this run's {n_steps} steps")
+        raise SystemExit(f"{source} is already at step {state.step}, past this run's {n_steps} steps")
+    if cfg.branch_from is not None:
+        # A branch is only the run it claims to be if both lr schedules agree on every step before the branch point.
+        old_n = train_data.n_steps(old.data.n_tokens)
+        t, o = cfg.train, old.train
+        same_lr = (t.lr, t.muon_lr) == (o.lr, o.muon_lr) and all(
+            lr_factor(i, n_steps, t.warmup_frac, t.decay_frac, t.min_lr_frac)
+            == lr_factor(i, old_n, o.warmup_frac, o.decay_frac, o.min_lr_frac)
+            for i in range(state.step)
+        )
+        if not same_lr:
+            print(f"warning: this run's lr schedule differs from {source}'s before step {state.step}; the branch is "
+                  "not the same as training this run from scratch")
+        return state, weights, None
     for k in ("lr", "muon_lr", "warmup_frac", "decay_frac"):
         a, b = getattr(old.train, k), getattr(cfg.train, k)
         if a != b:
@@ -101,18 +119,25 @@ def run_train(cfg: RunConfig) -> tuple[GPT, TrainResult]:
     n_steps = train_data.n_steps(cfg.data.n_tokens)
     model = build_model(cfg, next(val_data.eval_batches(1))[0])
     resume, resume_id, extra = None, None, None
+    if cfg.resume is not None and cfg.branch_from is not None:
+        raise SystemExit("use either --resume or --branch-from, not both")
     if cfg.resume is not None:
         resume, weights, resume_id = load_resume(cfg, train_data, n_steps)
         model.load_state_dict(weights)
         extra = {"resumed_from": Path(cfg.resume).name, "resumed_at_step": resume.step}
+    elif cfg.branch_from is not None:
+        resume, weights, _ = load_resume(cfg, train_data, n_steps, cfg.branch_from)
+        model.load_state_dict(weights)
+        branch = Path(cfg.branch_from)
+        extra = {"branched_from": f"{branch.parent.name}/{branch.name}", "branched_at_step": resume.step}
     run = init_wandb(cfg, model, resume_id, extra)
     if run is not None and resume is not None:
         keep_old_final(run, resume.step * train_data.block_size * train_data.batch_size)
     run_name = cfg.wandb_name or (run.name if run is not None else time.strftime("%Y%m%d-%H%M%S"))
     out_dir = cfg.out_dir / run_name
 
-    def save_state(state: TrainState) -> None:
-        write_state(out_dir, model, state, cfg, train_data.n_windows, None if run is None else run.id)
+    def save_state(state: TrainState, name: str = "state.pt") -> None:
+        write_state(out_dir, model, state, cfg, train_data.n_windows, None if run is None else run.id, name)
 
     result = train(
         model, train_data, val_data, tokenizer, cfg.train, n_steps, run=run, resume=resume, save_state=save_state

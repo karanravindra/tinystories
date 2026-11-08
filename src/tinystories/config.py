@@ -18,8 +18,18 @@ class ModelConfig:
     n_layers: int = 4
     tie_embeddings: bool = True
     """tie the output head to tok_emb (--model.no-tie-embeddings for a separate head)"""
+    mlp: Literal["gelu", "relu2", "swiglu"] = "gelu"
+    """MLP type: GELU or ReLU^2 with 4x width, or SwiGLU with 8/3x width (same weight count)"""
+    qk_norm: bool = False
+    """RMS-normalize queries and keys in attention (then scale logits by 1/sqrt(head_dim))"""
+    value_embeds: int = 0
+    """extra token-embedding tables added to the attention values of the first and last this-many layers"""
     vocab_size: Annotated[int, tyro.conf.Suppress] = 0
     """filled in from the tokenizer"""
+    eos_id: Annotated[int, tyro.conf.Suppress] = -1
+    """filled in from the tokenizer (end-of-story token, used by doc_mask)"""
+    doc_mask: bool = False
+    """block attention across story boundaries (an EOS ends its story); uses flex attention"""
 
 
 @dataclass
@@ -38,14 +48,16 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     optimizer: Literal["muon", "adamw"] = "muon"
-    lr: float = 0.02
+    lr: float = 0.04
     """AdamW lr (also embeddings/head/norms under muon)"""
-    muon_lr: float = 0.0018
+    muon_lr: float = 0.0036
     """Muon lr for hidden weight matrices"""
     batch_size: int = 64
-    warmup_frac: float = 0.02
-    decay_frac: float = 0.2
-    """fraction of steps at the end over which LR decays linearly to 0"""
+    warmup_frac: float = 0.0
+    decay_frac: float = 0.5
+    """fraction of steps at the end over which LR decays linearly to min_lr_frac"""
+    min_lr_frac: float = 0.0
+    """where the decay ends, as a fraction of the peak LR (0 = decay to zero)"""
     compile_mode: Literal["none", "default", "reduce-overhead", "max-autotune"] = "reduce-overhead"
     eval_every: int = 100
     """steps between subset val evals (0 disables; a full val eval always runs at the end)"""
@@ -53,6 +65,11 @@ class TrainConfig:
     log_every: int = 50
     save_every: int = 1000
     """steps between resumable state saves (<run dir>/state.pt; 0 = only at the end)"""
+    snapshot_steps: tuple[int, ...] = ()
+    """steps at which to also keep a copy of the state (<run dir>/state-<step>.pt), to branch other runs from"""
+    stop_after: int = 0
+    """stop after this many steps (after saving its snapshot), without the final eval: for a constant-lr parent run
+    whose rest is trained by branches (0 = run to the end)"""
     seed: int = 0
 
 
@@ -71,12 +88,17 @@ class RunConfig:
     """run name (also the output subdir); default: wandb's name, else a timestamp"""
     resume: Path | None = None
     """run dir to continue from (its state.pt): same model and data settings, --data.n-tokens is the new total"""
+    branch_from: Path | None = None
+    """state file to start a NEW run from (e.g. <run dir>/state-10343.pt): its weights, optimizer state and step, but
+    this run's name, wandb run and lr schedule; same model, data and batch settings. For trying lr decays off one
+    constant-lr run without retraining the shared steps."""
 
     def to_dict(self) -> dict:
         """JSON-safe dict (Paths -> str), so checkpoints load with torch.load(weights_only=True)."""
         d = asdict(self)
         d["out_dir"] = str(self.out_dir)
         d["resume"] = None if self.resume is None else str(self.resume)
+        d["branch_from"] = None if self.branch_from is None else str(self.branch_from)
         d["data"]["cache_dir"] = str(self.data.cache_dir)
         return d
 
@@ -87,7 +109,7 @@ class RunConfig:
             data=DataConfig(**{**d["data"], "cache_dir": Path(d["data"]["cache_dir"])}),
             train=TrainConfig(**d["train"]),
             **{
-                k: Path(v) if k in ("out_dir", "resume") and v is not None else v
+                k: Path(v) if k in ("out_dir", "resume", "branch_from") and v is not None else v
                 for k, v in d.items()
                 if k not in ("model", "data", "train")
             },

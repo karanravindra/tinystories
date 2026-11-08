@@ -34,7 +34,7 @@ def _muon_and_adamw(model: GPT, cfg: TrainConfig) -> list[torch.optim.Optimizer]
     # norms and biases go to AdamW.
     muon_params, adamw_params = [], []
     for name, p in model.named_parameters():
-        is_hidden_matrix = p.ndim == 2 and not name.startswith(("tok_emb", "head"))
+        is_hidden_matrix = p.ndim == 2 and not name.startswith(("tok_emb", "head", "value_embeds"))
         (muon_params if is_hidden_matrix else adamw_params).append(p)
     return [
         torch.optim.Muon(muon_params, lr=cfg.muon_lr),
@@ -42,8 +42,9 @@ def _muon_and_adamw(model: GPT, cfg: TrainConfig) -> list[torch.optim.Optimizer]
     ]
 
 
-def lr_factor(step: int, total: int, warmup_frac: float, decay_frac: float) -> float:
-    """Warmup-stable-decay: linear warmup, flat, then linear decay to 0 over the last decay_frac of steps.
+def lr_factor(step: int, total: int, warmup_frac: float, decay_frac: float, min_frac: float = 0.0) -> float:
+    """Warmup-stable-decay: linear warmup, flat, then linear decay to min_frac (default 0) over the last decay_frac
+    of steps.
 
     `step` is 0-based (the LR used for the (step+1)-th update).
     """
@@ -52,7 +53,7 @@ def lr_factor(step: int, total: int, warmup_frac: float, decay_frac: float) -> f
     if step < warmup:
         return (step + 1) / warmup
     if step >= total - decay:
-        return max(0.0, (total - step) / decay)
+        return min_frac + (1 - min_frac) * max(0.0, (total - step) / decay)
     return 1.0
 
 
@@ -122,7 +123,7 @@ def train(
     n_steps: int,
     run=None,
     resume: TrainState | None = None,
-    save_state: Callable[[TrainState], None] | None = None,
+    save_state: Callable[..., None] | None = None,
 ) -> TrainResult:
     """n_steps of training (repeating the train data in reshuffled epochs if needed), then a full val eval.
 
@@ -180,7 +181,7 @@ def train(
             for opt in optimizers:
                 opt.zero_grad(set_to_none=True)
             loss.backward()
-            f = lr_factor(step - 1, n_steps, cfg.warmup_frac, cfg.decay_frac)
+            f = lr_factor(step - 1, n_steps, cfg.warmup_frac, cfg.decay_frac, cfg.min_lr_frac)
             for opt in optimizers:
                 for g in opt.param_groups:
                     g["lr"] = g["base_lr"] * f
@@ -197,6 +198,19 @@ def train(
 
             if step % cfg.log_every == 0 or step == n_steps:
                 flush(step, time.time() - t0)
+
+            if save_state is not None and step in cfg.snapshot_steps:
+                if pending:
+                    flush(step, time.time() - t0)
+                save_state(snapshot(step), f"state-{step}.pt")
+
+            if cfg.stop_after and step >= cfg.stop_after and step < n_steps:
+                if pending:
+                    flush(step, time.time() - t0)
+                if save_state is not None:
+                    save_state(snapshot(step), f"state-{step}.pt")
+                print(f"stopped after step {step} (--train.stop-after); branch from state-{step}.pt", flush=True)
+                raise SystemExit(0)
 
             if save_state is not None and cfg.save_every > 0 and step % cfg.save_every == 0 and step < n_steps:
                 if pending:
@@ -231,9 +245,10 @@ def save_checkpoint(out_dir: Path, model: GPT, cfg: RunConfig, tokenizer: BPETok
 
 
 def write_state(
-    out_dir: Path, model: GPT, state: TrainState, cfg: RunConfig, train_windows: int, wandb_id: str | None
+    out_dir: Path, model: GPT, state: TrainState, cfg: RunConfig, train_windows: int, wandb_id: str | None,
+    name: str = "state.pt",
 ) -> None:
-    """Save `state` with its run config to <out_dir>/state.pt (via a temp file, so a crash never leaves half a file)."""
+    """Save `state` with its run config to <out_dir>/<name> (via a temp file, so a crash never leaves half a file)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     r = state.result
     blob = {
@@ -247,17 +262,36 @@ def write_state(
         "train_windows": train_windows,  # the shuffled pool; resuming needs the same one to continue the order
         "wandb_id": wandb_id,  # resuming continues this wandb run, so its curves (and _runtime) carry on
     }
-    tmp = out_dir / "state.pt.tmp"
+    tmp = out_dir / f"{name}.tmp"
     torch.save(blob, tmp)
-    tmp.replace(out_dir / "state.pt")
+    tmp.replace(out_dir / name)
 
 
-def read_state(run_dir: Path, device: str) -> tuple[TrainState, dict, RunConfig, int, str | None]:
-    """(train state, model weights, run config, train windows, wandb run id) saved by a run, for resuming it."""
-    blob = torch.load(run_dir / "state.pt", map_location=device, weights_only=True)
+def _drop_empty_params(sd: dict) -> dict:
+    """An optimizer state dict without the empty ve_gains of older runs, renumbered. That param never had a gradient,
+    so it is the one param with no optimizer state (every other param has state after the first step)."""
+    empty = {i for g in sd["param_groups"] for i in g["params"] if i not in sd["state"]}
+    assert len(empty) <= 1, f"expected at most one param without optimizer state, found {len(empty)}"
+    if not empty:
+        return sd
+    old_ids = [i for g in sd["param_groups"] for i in g["params"] if i not in empty]
+    new_id = {old: new for new, old in enumerate(old_ids)}
+    groups = [{**g, "params": [new_id[i] for i in g["params"] if i not in empty]} for g in sd["param_groups"]]
+    return {"state": {new_id[i]: st for i, st in sd["state"].items() if i not in empty}, "param_groups": groups}
+
+
+def read_state(path: Path, device: str) -> tuple[TrainState, dict, RunConfig, int, str | None]:
+    """(train state, model weights, run config, train windows, wandb run id) saved by a run, for resuming it.
+
+    `path` is a run dir (its state.pt) or a state file."""
+    path = Path(path)
+    blob = torch.load(path / "state.pt" if path.is_dir() else path, map_location=device, weights_only=True)
     result = TrainResult(losses=blob["losses"], val=[tuple(v) for v in blob["val"]])
     state = TrainState(blob["step"], blob["optimizers"], result, blob["train_seconds"])
-    return state, blob["model"], RunConfig.from_dict(blob["config"]), blob["train_windows"], blob["wandb_id"]
+    weights = {k: v for k, v in blob["model"].items() if not (k == "ve_gains" and v.numel() == 0)}  # see load_checkpoint
+    if len(weights) < len(blob["model"]):
+        state.optimizers = [_drop_empty_params(sd) for sd in state.optimizers]
+    return state, weights, RunConfig.from_dict(blob["config"]), blob["train_windows"], blob["wandb_id"]
 
 
 def load_checkpoint(ckpt_dir: str | Path, device: str = "cpu") -> tuple[GPT, BPETokenizer, RunConfig]:
@@ -265,7 +299,9 @@ def load_checkpoint(ckpt_dir: str | Path, device: str = "cpu") -> tuple[GPT, BPE
     ckpt = torch.load(ckpt_dir / "model.pt", map_location=device, weights_only=True)
     cfg = RunConfig.from_dict(ckpt["config"])
     model = GPT(ModelConfig(**ckpt["config"]["model"])).to(device)
-    model.load_state_dict(ckpt["model"])
+    # Runs from before value embeddings were optional saved an empty ve_gains; drop it.
+    weights = {k: v for k, v in ckpt["model"].items() if not (k == "ve_gains" and v.numel() == 0)}
+    model.load_state_dict(weights)
     model.eval()
     return model, BPETokenizer.load(ckpt_dir / "tokenizer.json"), cfg
 
