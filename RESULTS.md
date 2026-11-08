@@ -6,7 +6,7 @@ We train small GPT-style language models on [TinyStories](https://huggingface.co
 
 **Setup for all runs below** (unless noted): 4 layers, width 192, a tokenizer we train ourselves, Muon optimizer for the main weight matrices and AdamW for everything else, a constant learning rate (no warmup or decay), one seed per setting.
 
-**Current best settings:** 16k or 32k vocabulary, AdamW lr 0.02, Muon lr 0.0018 (tuned for 500M training tokens). These are the defaults in `src/tinystories/config.py`. For model shape, use 4–6 layers and as much width as the time budget allows (section 6); the default model shape has not been updated to match.
+**Current best settings:** 16k vocabulary, AdamW lr 0.04, Muon lr 0.0036, no warmup, learning rate decaying to zero over the last 50% of training (section 7). These are the training defaults in `src/tinystories/config.py`. Model: width 384, 6 layers, with `--model.mlp swiglu --model.qk-norm --model.doc-mask --model.value-embeds 2 --model.no-tie-embeddings` (section 7). These model options are flags, not defaults, so older checkpoints still load as they were trained. For model shape, use 4–6 layers and as much width as the time budget allows (section 6).
 
 Figures are in `results/`. To redraw them from wandb: `uv run python results/plot.py`.
 
@@ -29,7 +29,6 @@ wandb group: `vocab-d192-oldlr`
 - **Going past 16k didn't help.** 16k and 32k scored the same. TinyStories uses a small set of simple words, so a 16k vocabulary already covers them.
 - **Bigger vocabularies are slower.** For a model this small, most of the computation goes into choosing among all possible tokens at the output, so a bigger vocabulary costs more time per step.
 - **Bigger vocabularies started slowly.** Early in training they scored worse and only caught up later. Section 4 shows this was caused by the learning rate being too low.
-asdfa
 ## 2. Learning rates at 250M tokens (2026-11-06)
 
 **Question:** What learning rates should we use? The model has two optimizers, each with its own learning rate:
@@ -170,3 +169,102 @@ wandb group: `shape-v16k-500M` (the width 192, 4-layer run is the matching run f
   - **Learning rates:** they were tuned only at width 192 with 4 layers. The model is set up so the learning rate should carry over to other widths (muP), but not to other depths, and we haven't checked either.
   - **Missing shapes:** the shapes most likely to win, width 512 at 6–8 layers and width 640 and up at 4–8 layers, were not run. A width-640, 4-layer run crashed at 39M tokens, and a width-1024, 2-layer run stopped at 168M tokens; both are left out.
   - **Time budgets:** the times include each run's startup and compile time (under a minute), and come from a run stopped partway, not from a run whose learning rate was planned for that length.
+
+## 7. AI hill climb: width 384, 6 layers, one epoch (2026-11-07)
+
+**Question:** How low can width 384 with 6 layers go in one epoch (423.7M tokens), and can it beat TinyStories-33M (0.468 per-story bpb, section 5)?
+
+Claude ran this on its own with a 2-hour budget: at most one epoch, batch 64 × 512 tokens, 16k vocab, seed 0. Each change was tried on top of the best run so far. To save GPU time, some runs were split into a constant-rate "parent" that stops at step 10,343 (or 9,050) and a "branch" that trains only the decay from the parent's saved state. This gives the same result as one full run (checked on a small model: 1.6662 vs 1.6664 bpb). Per-story bpb is section 5's metric (`results/eval_perstory.py`), which can be compared with the official models. It runs about 0.015 below full-val bpb, so the two metrics can't be compared with each other. For models with document masking, the per-story numbers use the mask at every length. An earlier version applied it only to batches whose length was a multiple of 128, which scored these models 0.002–0.004 worse.
+
+wandb groups: `decay-d384L6-v16k-424M` (7.a), `hillclimb-d384L6-v16k-424M` (7.b–7.f)
+
+![Score during training for each kept step, and per-story bpb against the official models](results/hillclimb.png)
+
+*(a) In-training validation bpb (a 655k-token slice) for each kept step; final full-val bpb in the legend. Runs split into parent and branch are drawn joined. (b) Per-story bpb against parameters outside the embeddings. Colored dots are our runs from (a), all with 10.6M; the diamond is the best.*
+
+| Step | Change (kept on top of the previous row) | Full-val bpb (lower is better) | Per-story bpb (lower is better) |
+|---|---|---|---|
+| Start | Constant learning rate (section 6) | 0.5452 | 0.5299 |
+| 7.a | Decay to zero over the last 20% | 0.5064 | 0.4908 |
+| 7.b | ×2 learning rates (AdamW 0.04, Muon 0.0036) | 0.5020 | 0.4864 |
+| 7.d | SwiGLU, QK-norm, document masking | 0.4918 | 0.4737 |
+| 7.e | Value embeddings, untied output layer | 0.4802 | 0.4620 |
+| 7.e | Decay over the last 30% instead of 20% | 0.4768 | 0.4586 |
+| 7.f | Decay over the last 50% | **0.4737** | **0.4555** |
+| | TinyStories-33M (section 5) | – | 0.468 |
+
+**What we learned:**
+- **We beat TinyStories-33M on its own metric: 0.4555 vs 0.468 per-story bpb,** with 10.6M weights in the layers vs 28.3M, and fewer weights in total (35.8M vs 68.5M; most of both are lookup tables). The margin is about 8× seed noise.
+- **Decaying the learning rate to zero was the biggest win** (0.039), about as much as everything else combined.
+- **With decay, the best learning rates are about twice the constant-rate ones,** and the architecture changes add about 0.022 on top.
+- **Not established:** one seed per run (noise about ±0.0015); the five architecture changes were only tested in groups; learning rates and decay length were only lightly tuned on the final model; batch size was never changed.
+
+### 7.a Learning-rate decay
+
+![Score during training and learning rate, for a constant rate and two decay lengths](results/decay_curves.png)
+
+*Same model and data order; only the schedule differs. Legend: final full-val bpb.*
+
+- **Decay over the last 20%: 0.5064** (constant: 0.5452). The score drops almost in a straight line with the learning rate and is still falling when the rate reaches zero.
+- **Decay over the last 70%: 0.5086,** close to a tie. It's far ahead mid-run because its rate drops sooner, but the 20% decay catches up at the end.
+- Generations improve visibly: whole stories with a start, problem and ending, about TinyStories-8M quality by eye.
+
+### 7.b Learning rates
+
+- **×2 (AdamW 0.04, Muon 0.0036): 0.5020,** 0.0044 better than ×1. It's worse during the flat part (0.570 vs 0.560 at step 10,000) but gains more during the decay: the decay removes the extra jitter of a high rate and keeps its extra progress.
+- **×0.5: stopped at step ~3,800,** far behind (0.644 vs about 0.61) with no sign of closing.
+
+### 7.c Value embeddings and an untied output layer (×1 learning rates)
+
+- **2 value-embedding tables + untied output layer: 0.5012,** 0.0052 better than 7.a. Value embeddings are extra token-embedding tables added to the attention values of the first two and last two layers (from the modded-nanogpt speedrun). They add 19M lookup weights and almost no compute. The run starts slower and pulls ahead after step 6,000.
+
+### 7.d SwiGLU, QK-norm, document masking (×2 learning rates)
+
+- **All three together: 0.4918,** 0.0102 better than 7.b, ahead at every step. SwiGLU is a gated MLP with the same weight count. QK-norm normalizes queries and keys, which keeps attention stable at high rates. Document masking stops attention from reaching into the previous story in the same window. Its first decay branch crashed on a bug in the new branching code (fixed); the rerun branched from the same saved state.
+
+### 7.e Everything together
+
+- **7.d + 7.c's changes, decay 20%: 0.4802** (per-story 0.4620). The 7.c changes gained 0.0116 here, more than at ×1 rates.
+- **Same, decay 30%: 0.4768** (per-story 0.4586), best of 7.e. A branch from the step-9,050 state, so it cost 3,879 steps.
+- **Same, ×3 learning rates, decay 20%: 0.4814** (per-story 0.4632), a tie with ×2.
+- Generations keep a consistent plot and characters, with small slips left ("the birds came and ate them"); close to TinyStories-28M and 33M by eye.
+
+### 7.f Decay length, and decaying to zero or not
+
+**Question:** On the final model, is a longer decay better still, and should the learning rate end at zero or at a floor?
+
+- **Decay over the last 50%: 0.4737 full-val, 0.4555 per-story. New best,** 0.0031 better than 30% (about 2× seed noise). It's behind the shorter decays until its rate starts dropping at step 6,465, then far ahead (0.518 vs 0.547 at step 10,000), and it's still ahead at the end. Its saved states at steps 3,879, 5,172 and 6,465 let 60–70% decays branch from it.
+- **Decay over the last 20%, ending at 10% of the peak instead of zero: 0.4827,** 0.0025 worse than decaying to zero (0.4802), about 1.7× seed noise. It falls behind as soon as the schedules split, and the gap grows toward the end (0.4929 vs 0.4900 at step 12,900). So decay all the way to zero: the last, smallest steps still help. Per-story: 0.4644 vs 0.4620.
+
+| Decay (final model, ×2 learning rates) | Full-val bpb (lower is better) | Per-story bpb (lower is better) |
+|---|---|---|
+| Last 20%, to zero | 0.4802 | 0.4620 |
+| Last 20%, to 10% of peak | 0.4827 | 0.4644 |
+| Last 30%, to zero | 0.4768 | 0.4586 |
+| Last 50%, to zero | **0.4737** | **0.4555** |
+
+- **Longer decays keep helping on this model:** 20% → 30% → 50% gains 0.0034, then 0.0031. In 7.a (×1 rates, older model) 70% was slightly worse than 20%, so the best length depends on the setup. 50% is the edge of what we tried here.
+
+## 8. Generations: our best model vs the official models (2026-11-07)
+
+**Question:** Section 7's best model beats TinyStories-33M on per-story bpb. Do its stories read as well?
+
+We sampled 5 stories for each of 4 prompts (the section 5 prompts) from our best model (section 7.f: width 384, 6 layers, decay over the last 50%) and from TinyStories-33M, 28M and 8M. Temperature 0.8, no top-k, up to 300 tokens. Each model gets its own seeds. With shared seeds, the official models, which share a tokenizer, draw the same random numbers and start their stories almost identically. The official samples are cached, so reruns only generate ours.
+
+Script: `results/compare_generations.py`. All 80 stories: `results/generations_compare.md`.
+
+| | Ours (d384/L6) | TinyStories-33M | TinyStories-28M | TinyStories-8M |
+|---|---|---|---|---|
+| Average length (words) | 146 | 141 | 128 | 151 |
+| Stories cut off at 300 tokens (of 20) | 0 | 0 | 1 | 1 |
+| Quoted lines of dialogue | 53 | 33 | 42 | 30 |
+| Distinct words per 100 words | 18.1 | 17.9 | 21.1 | 17.7 |
+
+*Counts over each model's 20 stories. These are rough measures of style, not quality.*
+
+**What we learned:**
+- **Ours read about as well as TinyStories-28M and 33M.** All three write complete, coherent stories, and all make occasional small slips at about the same rate. Ours: Tom "barked at the truck driver"; a big bird advising "you need a small brain to fly". 33M: "a man sitting on her shoulder"; a bird that tries to "use that saw to soar"; Tom "was scared and barked".
+- **Length and endings are similar.** Ours are about as long and always finish within 300 tokens. Ours use the most dialogue.
+- **The one clear difference is how stories open.** All 5 of our unprompted stories start "Once upon a time, there was", though with different characters and plots (a boy making a kayak, Lily twice, Timmy, a rabbit's race). 33M varies its first line more ("John was a curious three-year-old…", "Once there was a strong little boy named Peter…").
+- **Small samples mislead.** A first try with 3 samples per prompt and shared seeds suggested ours used less dialogue, often ended with "The moral of the story is", and always started with Lily. With 20 samples per model and separate seeds, none of that holds.
+- **Not established:** this is one reader's judgment of 80 stories, not a blind or scored comparison.
