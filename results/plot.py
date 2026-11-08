@@ -15,7 +15,9 @@ from matplotlib.colors import LinearSegmentedColormap
 
 OUT = Path(__file__).parent
 CACHE = OUT / "runs.json"
-GROUPS = ["vocab-d192-oldlr", "vocab-d192-tunedlr", "lr-d192-v16k-250M", "lr-d192-v16k-500M", "shape-v16k-500M"]
+GROUPS = ["vocab-d192-oldlr", "vocab-d192-tunedlr", "lr-d192-v16k-250M", "lr-d192-v16k-500M", "shape-v16k-500M",
+          "decay-d384L6-v16k-424M", "hillclimb-d384L6-v16k-424M"]
+KEEP_UNFINISHED = {"hillclimb-d384L6-v16k-424M"}  # its stopped runs are reported too (as "stopped")
 
 # SciencePlots style (https://github.com/garrettj403/SciencePlots). "no-latex": no TeX install needed.
 import scienceplots  # noqa: F401,E402  (registers the styles)
@@ -34,7 +36,8 @@ def fetch() -> list[dict]:
     runs = []
     for group in GROUPS:
         for r in api.runs(f"{api.default_entity}/tinystories", filters={"group": group}):
-            if r.state != "finished" or any(x["id"] == r.id for x in runs):
+            ok = r.state == "finished" or (group in KEEP_UNFINISHED and r.state == "killed")
+            if not ok or any(x["id"] == r.id for x in runs):
                 continue
             h = r.history(samples=100000, keys=["val/bpb", "tokens_seen", "_runtime", "_step"], pandas=True).dropna()
             c = r.config
@@ -47,6 +50,11 @@ def fetch() -> list[dict]:
                 "final_bpb": r.summary.get("final/val_bpb"),  # None if the run stopped before its final eval
                 "step": h["_step"].tolist(), "tokens": h["tokens_seen"].tolist(),
                 "time": h["_runtime"].tolist(), "bpb": h["val/bpb"].tolist(),
+                "state": r.state, "decay_frac": c["train"].get("decay_frac", 0.0),
+                "model": {k: c["model"].get(k) for k in ("mlp", "qk_norm", "doc_mask", "value_embeds", "tie_embeddings")},
+                # A branch run logs only its own steps; its first steps are its parent's (see plot.stitched).
+                "branched_from": (c.get("branched_from") or "").split("/")[0] or None,
+                "branched_at": c.get("branched_at_step"),
             })
     CACHE.write_text(json.dumps(runs))
     return runs
@@ -328,6 +336,122 @@ def plot_shape_size_time(runs):
     save(fig, "shape_size_time.png")
 
 
+HILL_TOKENS_PER_STEP = 64 * 512  # section 7 runs: batch 64 x 512 tokens
+
+
+def by_name(runs):
+    return {r["name"]: r for r in runs}
+
+
+def stitched(r, names):
+    """(tokens, bpb) for a run over its whole length. A branch run (7.d, 7.e) logged only the steps after its branch
+    point, so the steps before come from its parent: the two runs are identical up to there."""
+    tok, bpb = np.array(r["tokens"]), np.array(r["bpb"])
+    if r.get("branched_from"):
+        p = names[r["branched_from"]]
+        cut = r["branched_at"] * HILL_TOKENS_PER_STEP
+        pt, pb = np.array(p["tokens"]), np.array(p["bpb"])
+        tok, bpb = np.concatenate([pt[pt <= cut], tok[tok > cut]]), np.concatenate([pb[pt <= cut], bpb[tok > cut]])
+    return tok, bpb
+
+
+def find(runs, *parts):
+    """The one run whose name contains every part."""
+    hits = [r for r in runs if all(p in r["name"] for p in parts)]
+    assert len(hits) == 1, (parts, [r["name"] for r in hits])
+    return hits[0]
+
+
+def lr_multiplier(tokens, decay_frac, total=423_657_472):
+    """Section 7's schedule: flat, then a straight line down to 0 over the last decay_frac of training."""
+    start = total * (1 - decay_frac)
+    return np.clip((total - tokens) / max(total - start, 1), 0, 1) if decay_frac else np.ones_like(tokens)
+
+
+def plot_decay(runs):
+    """Section 7.a: constant learning rate vs decaying to zero over the last 20% or 70% of training."""
+    rows = [
+        (find(runs, "d384-L6", "muon0.0018-lr2e-2-t500M"), 0.0, "Constant"),
+        (find(runs, "muon0.0018-lr2e-2-decay0.2-t423M"), 0.2, "Decay over last 20%"),
+        (find(runs, "muon0.0018-lr2e-2-decay0.7-t423M"), 0.7, "Decay over last 70%"),
+    ]
+    fig, axes = plt.subplots(1, 2, figsize=(7, 2.8))
+    grid = np.linspace(0, 423.7e6, 400)
+    for k, (r, frac, label) in enumerate(rows):
+        tok, bpb = np.array(r["tokens"]), np.array(r["bpb"])
+        m = tok <= 424e6
+        final = r["final_bpb"]
+        axes[0].plot(tok[m] / 1e6, bpb[m], color=SERIES[k], linewidth=0.9, label=f"{label} ({final:.3f})")
+        axes[1].plot(grid / 1e6, lr_multiplier(grid, frac), color=SERIES[k], linewidth=1.2, label=label)
+    axes[0].set_xlim(100, 430)
+    axes[0].set_ylim(0.50, 0.63)
+    axes[0].set_xlabel("Tokens seen (millions)")
+    axes[0].set_ylabel("Validation bpb (lower is better)")
+    axes[0].set_title("(a) Score during training")
+    axes[0].legend(loc="upper right", title="Final full-val bpb", fontsize=6, title_fontsize=6)
+    axes[1].set_xlabel("Tokens seen (millions)")
+    axes[1].set_ylabel("Learning rate (fraction of peak)")
+    axes[1].set_ylim(-0.03, 1.08)
+    axes[1].set_title("(b) Learning-rate schedule")
+    save(fig, "decay_curves.png")
+
+
+def plot_hillclimb(runs):
+    """Section 7.b-7.e: the score during training for each kept step, and per-story bpb vs the official models."""
+    names = by_name(runs)
+    steps = [
+        (find(runs, "muon0.0018-lr2e-2-decay0.2-t423M"), "7.a decay 20%"),
+        (find(runs, "muon0.0036-lr4e-2-decay0.2-t423M"), "7.b + ×2 learning rates"),
+        (find(runs, "lr4e-2-decay0.2-swiglu-qkn-docmask-t423M"), "7.d + SwiGLU, QK-norm, doc mask"),
+        (find(runs, "lr4e-2-decay0.2-all-t423M"), "7.e + value emb., untied"),
+        (find(runs, "lr4e-2-decay0.3-all-t423M"), "7.e decay 30%"),
+        (find(runs, "lr4e-2-decay0.5-all-t423M"), "7.f decay 50%"),
+    ]
+    styles = ["-", "-", "-", "-", "--", ":"]
+    fig, axes = plt.subplots(1, 2, figsize=(7, 2.8))
+    ax = axes[0]
+    for k, (r, label) in enumerate(steps):
+        tok, bpb = stitched(r, names)
+        ax.plot(tok / 1e6, bpb, color=SERIES[k], linestyle=styles[k], linewidth=0.9, label=f"{label} ({r['final_bpb']:.3f})")
+    ax.set_xlim(100, 430)
+    ax.set_ylim(0.43, 0.62)
+    ax.set_xlabel("Tokens seen (millions)")
+    ax.set_ylabel("Validation bpb (lower is better)")
+    ax.set_title("(a) Score during training, width 384, 6 layers")
+    ax.legend(loc="lower left", title="Final full-val bpb", fontsize=5.5, title_fontsize=6)
+
+    # (b) Per-story bpb (section 5's metric) against size: the official models, and our runs.
+    ax = axes[1]
+    official = json.loads((OUT / "official_eval.json").read_text())["results"]
+    ours = json.loads((OUT / "perstory.json").read_text())
+    off = {k: v for k, v in official.items() if k.startswith("TinyStories")}
+    x = [v["non_emb_params"] / 1e6 for v in off.values()]
+    y = [v["bpb"] for v in off.values()]
+    ax.scatter(x, y, color=INK_2, s=10, zorder=2, label="Official TinyStories models")
+    offsets = {"TinyStories-28M": (-4, 4, "right"), "TinyStories-33M": (4, -7, "left")}
+    for name, xi, yi in zip(off, x, y):
+        dx, dy, ha = offsets.get(name, (4, 2, "left"))
+        ax.annotate(name.removeprefix("TinyStories-"), (xi, yi), textcoords="offset points", xytext=(dx, dy), ha=ha,
+                    fontsize=5.5, family="DejaVu Sans", color=INK_2, annotation_clip=True)
+    for k, (r, label) in enumerate(steps):
+        if r["name"] in ours:
+            ax.scatter(10.6, ours[r["name"]], color=SERIES[k], s=12, zorder=3, marker="D" if k == len(steps) - 1 else "o")
+    for key in ("ours-v16k", "ours-v32k"):
+        ax.scatter(official[key]["non_emb_params"] / 1e6, official[key]["bpb"], facecolor="white", edgecolor=INK_2,
+                   marker="s", s=10, zorder=3, label="Ours, width 192 (section 5)" if key == "ours-v16k" else None)
+    best = min(ours[r["name"]] for r, _ in steps if r["name"] in ours)
+    ax.annotate(f"ours, best: {best:.3f}", (10.6, best), textcoords="offset points", xytext=(-6, -2), ha="right",
+                fontsize=5.5, family="DejaVu Sans", color=SERIES[len(steps) - 1])
+    log_ticks(ax, [1, 2, 5, 10, 20, 30])
+    ax.set_xlim(1.2, 40)
+    ax.set_ylim(0.45, 0.65)
+    ax.set_xlabel("Parameters excluding embeddings (millions)")
+    ax.set_ylabel("Per-story bpb (lower is better)")
+    ax.set_title("(b) Ours (colors as in (a)) vs the official models")
+    ax.legend(loc="upper right", fontsize=5.5)
+    save(fig, "hillclimb.png")
+
+
 if __name__ == "__main__":
     runs = json.loads(CACHE.read_text()) if "--cached" in sys.argv else fetch()
     plot_vocab(runs)
@@ -336,3 +460,5 @@ if __name__ == "__main__":
     plot_lr_vs_length(runs)
     plot_shape_grid(runs)
     plot_shape_size_time(runs)
+    plot_decay(runs)
+    plot_hillclimb(runs)
